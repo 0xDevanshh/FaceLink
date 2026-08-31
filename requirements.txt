@@ -1,0 +1,31 @@
+# FaceChain — Python 3.11 or 3.12 recommended.
+# Python 3.13/3.14 currently lack onnxruntime wheels, which InsightFace needs.
+
+# --- face detection + embedding ---
+insightface==1.0.1            # SCRFD detector + ArcFace recogniser (buffalo_l)
+onnxruntime==1.29.0           # CPU inference for the InsightFace ONNX models
+opencv-python-headless==5.0.0.93
+numpy==2.2.6
+
+# --- perceptual image hashing ---
+ImageHash==4.3.2
+pillow==12.3.0
+
+# --- reverse image search ---
+playwright==1.62.0            # drives real Google Lens / Yandex / Bing UIs
+beautifulsoup4==4.15.0
+lxml==6.1.2
+httpx==0.28.1
+
+# --- blockchain (Base Sepolia + EAS) ---
+web3==7.16.0
+eth-account==0.14.0
+eth-utils==6.0.0
+
+# --- plumbing ---
+pydantic==2.13.5
+pydantic-settings==2.15.0
+rich==15.0.0
+
+# --- tests ---
+pytest==9.1.1

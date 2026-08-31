@@ -5,9 +5,8 @@ from __future__ import annotations
 import logging
 from urllib.parse import quote
 
-from ..config import settings
-from .base import EngineResult, SearchEngineAdapter, build_candidates
-from .browser import attach_file, click_text, detect_block, scroll_through, settle
+from .base import EngineResult, SearchEngineAdapter, collect_results
+from .browser import attach_file, settle
 
 log = logging.getLogger(__name__)
 
@@ -29,6 +28,9 @@ RESULT_CONTAINERS = (
     "#search",
     "div[role='main']",
 )
+MARKERS = ("exact matches", "visual matches", "pages with matching images",
+           "find image source", "about this image", "results for")
+VIEW_LABELS = (r"find image source", r"exact matches", r"pages with matching images")
 
 
 class GoogleLensAdapter(SearchEngineAdapter):
@@ -52,25 +54,15 @@ class GoogleLensAdapter(SearchEngineAdapter):
                                             error="could not attach file to Lens upload input")
                 settle(page, 2500)
 
-                blocked = detect_block(page)
-                if blocked:
-                    return EngineResult(self.name, ok=False, query_mode=mode, error=blocked)
-
-                # Lens defaults to "visual matches"; the source-pages view is the
-                # one that yields real page URLs (incl. social posts).
-                for label in (r"find image source", r"exact matches", r"pages with matching images"):
-                    if click_text(page, label, timeout_ms=3500):
-                        log.debug("clicked Lens view: %s", label)
-                        settle(page, 2500)
-                        break
-
-                scroll_through(page, rounds=4)
-                rows = self.harvest_anchors(page, RESULT_CONTAINERS)
-                cands = build_candidates(self.name, rows)
-                if not cands:
-                    return EngineResult(self.name, ok=False, query_mode=mode,
-                                        error="Lens returned no outbound result links")
-                return EngineResult(self.name, candidates=cands, query_mode=mode)
+                result = collect_results(
+                    page,
+                    engine=self.name,
+                    containers=RESULT_CONTAINERS,
+                    markers=MARKERS,
+                    view_labels=VIEW_LABELS,
+                )
+                result.query_mode = mode
+                return result
 
             except Exception as exc:  # noqa: BLE001
                 return EngineResult(self.name, ok=False, query_mode=mode,

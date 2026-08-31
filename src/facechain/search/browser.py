@@ -154,8 +154,20 @@ def click_text(page, pattern: str, timeout_ms: int = 4000) -> bool:
         return False
 
 
+# Interstitials whose URL alone proves we were challenged.
+BLOCK_URL_MARKERS = ("/sorry/", "/showcaptcha", "captcha", "checkcaptcha", "/blocked")
+
+
 def detect_block(page) -> str:
     """Return a human reason if the engine served a challenge instead of results."""
+    try:
+        url = (page.url or "").lower()
+    except Exception:  # noqa: BLE001
+        url = ""
+    for marker in BLOCK_URL_MARKERS:
+        if marker in url:
+            return f"bot challenge interstitial ({marker})"
+
     try:
         body = (page.inner_text("body") or "").lower()[:4000]
     except Exception:  # noqa: BLE001

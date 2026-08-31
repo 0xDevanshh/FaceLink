@@ -57,7 +57,10 @@ class EvidenceWriter:
     def copy_input(self, image_path: str | Path) -> Path:
         src = Path(image_path)
         dest = self.artifacts / f"input{src.suffix.lower() or '.jpg'}"
-        shutil.copy2(src, dest)
+        # Re-writing a bundle can pass the bundle's own copy back in; copying a
+        # file onto itself raises, and would truncate the evidence if it didn't.
+        if src.resolve() != dest.resolve():
+            shutil.copy2(src, dest)
         return dest
 
     # ---- the attested payload -------------------------------------------
@@ -91,6 +94,7 @@ class EvidenceWriter:
             image_similarity=q3(best.image_similarity),
             face_similarity=q3(best.face_similarity),
             match_score=q3(best.final_score),
+            match_type=best.match_type,
             stages_passed=[s.value for s in best.stages],
         )
 

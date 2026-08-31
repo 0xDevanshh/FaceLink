@@ -1,48 +1,27 @@
-# Python bytecode and caches
+# secrets — never commit
+.env
+.wallet-backup.txt
+*.pem
+*.key
+
+# evidence bundles contain a copy of the input photo and matched image hashes.
+# Keep the directory, ignore real cases (commit one redacted sample if you like).
+evidence/*
+!evidence/.gitkeep
+!evidence/sample_case/
+
+# model cache (hundreds of MB, downloaded on first run)
+.models/
+.insightface/
+
+# python
+.venv/
 __pycache__/
 *.py[cod]
-*$py.class
-
-# Virtual environments
-.venv/
-venv/
-env/
-ENV/
-
-# Packaging / build artifacts
-build/
-dist/
-*.egg-info/
-.eggs/
-*.egg
-
-# Test / coverage artifacts
 .pytest_cache/
-.coverage
-.coverage.*
-htmlcov/
-coverage.xml
+*.egg-info/
 
-# IDE/editor files
-.vscode/
-.idea/
-*.swp
-*.swo
+# os / editor
 .DS_Store
-
-# Logs and local runtime files
-*.log
-*.tmp
-*.bak
-
-# Jupyter / notebooks
-.ipynb_checkpoints/
-
-# Environment variables
-.env
-.env.*
-
-# Local sample/cache outputs if generated
-samples/output/
-output/
-cache/
+.idea/
+.vscode/

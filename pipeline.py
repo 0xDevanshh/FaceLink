@@ -23,7 +23,7 @@ from rich.text import Text  # noqa: E402
 
 from facechain import PIPELINE_VERSION  # noqa: E402
 from facechain.config import settings  # noqa: E402
-from facechain.models import Case, Stage  # noqa: E402
+from facechain.models import Case  # noqa: E402
 from facechain.runner import PipelineError, RunOptions, run  # noqa: E402
 
 console = Console(highlight=False)

@@ -21,7 +21,6 @@ from eth_account import Account
 from web3 import Web3
 from web3.logs import DISCARD
 
-from .. import PIPELINE_VERSION
 from ..config import (
     BASE_SEPOLIA_CHAIN_ID,
     EAS_CONTRACT,
@@ -50,8 +49,33 @@ FAUCET_HINT = (
 )
 
 
+# EAS reverts with 4-byte custom errors; a bare selector is useless in a demo.
+EAS_ERRORS = {
+    "0xbf37b20e": (
+        "InvalidSchema() — the schema UID is not registered on this chain. "
+        "Run `python scripts/register_schema.py` first (needs a little faucet ETH)."
+    ),
+    "0x08e8b937": "InvalidExpirationTime() — expiration must be 0 or in the future.",
+    "0xc5723b51": "NotFound() — no such attestation/schema.",
+    "0x947d5a84": "InvalidLength() — encoded schema data does not match the schema.",
+    "0xbd8ba84d": "InvalidAttestation() — attestation rejected by EAS.",
+    "0x4ca88867": "AccessDenied() — caller not permitted (resolver or revocation rules).",
+    "0x11011294": "InsufficientValue() — the schema's resolver requires ETH with the attestation.",
+    "0x157bd4c3": "Irrevocable() — schema is not revocable.",
+}
+
+
 class ChainError(RuntimeError):
     pass
+
+
+def translate_revert(exc: Exception) -> ChainError:
+    """Turn a web3 revert into something a human can act on."""
+    text = str(exc)
+    for selector, meaning in EAS_ERRORS.items():
+        if selector in text:
+            return ChainError(f"EAS reverted: {meaning}")
+    return ChainError(f"{type(exc).__name__}: {text[:300]}")
 
 
 class InsufficientFunds(ChainError):
@@ -177,7 +201,10 @@ class EasClient:
             "socialPlatform": payload.social_platform,
             "matchScoreBps": int(round(payload.match_score * 10_000)),
             "observedAt": int(payload.observed_at),
-            "pipelineVersion": PIPELINE_VERSION,
+            # The payload's own version, never the running one: re-deriving the
+            # fields from an older bundle must reproduce what was attested then,
+            # or the independent verifier reports a mismatch that never happened.
+            "pipelineVersion": payload.pipeline_version,
         }
 
     def _request(self, schema: str, data: bytes, recipient: str | None) -> tuple:
@@ -199,9 +226,20 @@ class EasClient:
         Costs nothing and needs no funded wallet, so the full pipeline can be
         exercised end to end before the faucet ETH lands.
         """
+        if not self._schema_exists(schema):
+            raise ChainError(
+                f"schema {schema} is not registered on Base Sepolia yet — "
+                "run `python scripts/register_schema.py` (one-off, needs faucet ETH). "
+                "Simulation cannot proceed without a registered schema."
+            )
         req = self._request(schema, encode_data(fields), recipient)
         sender = self.account.address if self.account else ZERO_ADDRESS
-        uid = self.eas.functions.attest(req).call({"from": sender})
+        try:
+            uid = self.eas.functions.attest(req).call({"from": sender})
+        except ChainError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise translate_revert(exc) from exc
         return "0x" + uid.hex() if isinstance(uid, bytes) else str(uid)
 
     def attest(
@@ -219,7 +257,12 @@ class EasClient:
             mode="onchain",
         )
 
-        receipt = self._send(self.eas.functions.attest(req), gas_floor=400_000)
+        try:
+            receipt = self._send(self.eas.functions.attest(req), gas_floor=400_000)
+        except ChainError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise translate_revert(exc) from exc
         tx_hash = receipt["transactionHash"].hex()
         tx_hash = tx_hash if tx_hash.startswith("0x") else "0x" + tx_hash
         record.tx_hash = tx_hash

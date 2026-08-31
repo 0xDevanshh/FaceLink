@@ -87,7 +87,7 @@ class Settings(BaseSettings):
     face_match_threshold: float = 0.38
 
     # ---- reverse image search --------------------------------------------
-    engines: str = "google_lens,yandex,bing"
+    engines: str = "yandex,bing,google_lens"
     headless: bool = True
     search_timeout_s: int = 60
     max_candidates_per_engine: int = 60

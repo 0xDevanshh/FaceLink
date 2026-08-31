@@ -17,15 +17,39 @@ from ..models import LADDER, Stage, VerifiedCandidate
 
 
 def score_candidate(vc: VerifiedCandidate) -> VerifiedCandidate:
-    """Populate `stages`, `final_score` and `verified` on a measured candidate."""
+    """Populate `stages`, `match_type`, `final_score` and `verified`.
+
+    What VERIFIED requires, and why:
+
+      SEARCH_FOUND  the URL came from a real reverse-image engine
+      SOCIAL_MATCH  it is a post on a supported social platform
+      FACE_MATCH    the face in the retrieved image matches the input face
+      final_score   >= `verify_min_score`, where image similarity carries 40%
+
+    `IMAGE_MATCH` is recorded but deliberately *not* mandatory. Social reposts
+    routinely crop, pad and overlay text, which drops a perceptual hash well
+    below the exact-image bar while the face stays unmistakable — and this is a
+    face-identification task, so the face is the primary signal and the image
+    hash is corroboration. Which of the two held is preserved in `match_type`:
+
+      "exact-image"  the retrieved image is perceptually the same picture
+      "face-only"    same face, visibly different/edited picture
+
+    A wrong person cannot sneak through: with face similarity near zero the
+    composite score cannot reach the threshold on image similarity alone.
+    """
     stages: list[Stage] = [Stage.SEARCH_FOUND]
 
     if vc.is_social:
         stages.append(Stage.SOCIAL_MATCH)
-    if vc.image_similarity >= settings.image_match_threshold:
+    exact_image = vc.image_similarity >= settings.image_match_threshold
+    if exact_image:
         stages.append(Stage.IMAGE_MATCH)
-    if vc.face_detected and vc.face_similarity >= settings.face_match_threshold:
+    face_ok = vc.face_detected and vc.face_similarity >= settings.face_match_threshold
+    if face_ok:
         stages.append(Stage.FACE_MATCH)
+
+    vc.match_type = "exact-image" if exact_image else ("face-only" if face_ok else "none")
 
     vc.final_score = (
         settings.weight_face * max(0.0, vc.face_similarity)
@@ -33,7 +57,7 @@ def score_candidate(vc: VerifiedCandidate) -> VerifiedCandidate:
         + settings.weight_meta * vc.metadata_consistency
     )
 
-    required = {Stage.SEARCH_FOUND, Stage.SOCIAL_MATCH, Stage.IMAGE_MATCH, Stage.FACE_MATCH}
+    required = {Stage.SEARCH_FOUND, Stage.SOCIAL_MATCH, Stage.FACE_MATCH}
     if required.issubset(set(stages)) and vc.final_score >= settings.verify_min_score:
         stages.append(Stage.VERIFIED)
         vc.verified = True
@@ -58,25 +82,39 @@ def highest_stage_reached(candidates: list[VerifiedCandidate]) -> list[Stage]:
 
 
 def explain_failure(candidates: list[VerifiedCandidate]) -> str:
-    """Say precisely which rung the run died on, for the CLI and the case file."""
+    """Say precisely which rung blocked verification.
+
+    The reason must describe the *social* candidates, since only those can ever
+    be verified — reporting the best overall candidate's numbers would claim a
+    threshold failure that never happened (e.g. a non-social page scoring 0.89
+    while the real blocker was that nothing social was found).
+    """
     if not candidates:
         return "no candidates survived reverse image search"
 
-    best = rank(candidates)[0]
-    if not any(c.is_social for c in candidates):
-        return "reverse search found matches, but none on a supported social platform"
-    if best.image_similarity < settings.image_match_threshold:
+    social = [c for c in candidates if c.is_social]
+    if not social:
+        best = rank(candidates)[0]
         return (
-            f"best image similarity {best.image_similarity:.3f} < "
-            f"threshold {settings.image_match_threshold}"
+            f"{len(candidates)} candidate(s) checked but none on a supported social "
+            f"platform (best non-social: {best.domain} at score {best.final_score:.3f})"
+        )
+
+    best = rank(social)[0]
+    if not best.candidate_image_sha256:
+        return (
+            f"social candidates found ({', '.join(sorted({c.domain for c in social}))}) but no "
+            "comparable image could be retrieved — login walls or bot blocks on every one"
         )
     if not best.face_detected:
-        return "no face detectable in the retrieved candidate image"
+        return f"no face detectable in the image retrieved from {best.domain}"
     if best.face_similarity < settings.face_match_threshold:
         return (
-            f"best face similarity {best.face_similarity:.3f} < "
-            f"threshold {settings.face_match_threshold}"
+            f"best social face similarity {best.face_similarity:.3f} < threshold "
+            f"{settings.face_match_threshold} ({best.domain})"
         )
     return (
-        f"final score {best.final_score:.3f} < threshold {settings.verify_min_score}"
+        f"best social candidate {best.domain} scored {best.final_score:.3f} < threshold "
+        f"{settings.verify_min_score} (face {best.face_similarity:.3f}, "
+        f"image {best.image_similarity:.3f})"
     )
