@@ -96,6 +96,7 @@ class VerifiedCandidate(BaseModel):
     metadata_consistency: float = 0.0
 
     stages: list[Stage] = Field(default_factory=list)
+    match_type: str = "none"  # exact-image | face-only | none
     final_score: float = 0.0
     verified: bool = False
 
@@ -153,6 +154,7 @@ class AttestedPayload(BaseModel):
     image_similarity: float
     face_similarity: float
     match_score: float
+    match_type: str
     stages_passed: list[str]
 
 

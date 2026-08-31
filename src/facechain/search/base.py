@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, parse_qsl, unquote, urlencode, urlparse, urlsplit, urlunsplit
 
 from ..config import SOCIAL_DOMAINS, settings
 from ..models import SearchCandidate
@@ -98,6 +98,31 @@ def unwrap_redirect(url: str) -> str:
     return url
 
 
+# Tracking parameters engines bolt on. They must be stripped before the URL is
+# hashed on-chain: the same post reached via two engines would otherwise produce
+# two different `matchedUrlHash` values, making the record non-reproducible.
+TRACKING_PARAMS = {
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+    "utm_referrer", "fbclid", "gclid", "dclid", "msclkid", "yclid",
+    "igshid", "ref_src", "ref_url", "si", "feature", "_ga", "mc_cid", "mc_eid",
+}
+
+
+def canonicalise_url(url: str) -> str:
+    """Drop tracking cruft and the fragment, keeping every meaningful parameter.
+
+    Only a known-tracking allowlist is removed — parameters that identify the
+    content itself (YouTube's `v`, for instance) are always preserved.
+    """
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return url
+    kept = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+            if k.lower() not in TRACKING_PARAMS]
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(kept), ""))
+
+
 def looks_like_post(url: str) -> bool:
     """Prefer a specific post over a bare profile or the platform's homepage."""
     path = urlparse(url).path.rstrip("/")
@@ -118,11 +143,10 @@ def build_candidates(engine: str, raw: list[dict], limit: int | None = None) -> 
         href = (row.get("href") or "").strip()
         if not href.startswith(("http://", "https://")):
             continue
-        href = unwrap_redirect(href)
+        href = canonicalise_url(unwrap_redirect(href))
         if is_junk(href):
             continue
-        # Direct image files are useful as evidence but are not "posts".
-        key = href.split("#")[0]
+        key = href.rstrip("/")
         if key in seen:
             continue
         seen.add(key)
@@ -144,6 +168,74 @@ def build_candidates(engine: str, raw: list[dict], limit: int | None = None) -> 
     # the task asks specifically for a social media post.
     out.sort(key=lambda c: (not c.is_social, not looks_like_post(c.url)))
     return out[:limit]
+
+
+def collect_results(
+    page,
+    *,
+    engine: str,
+    containers: tuple[str, ...],
+    markers: tuple[str, ...],
+    view_labels: tuple[str, ...] = (),
+    limit: int | None = None,
+) -> EngineResult:
+    """Shared post-query flow: prove we reached results, then extract them.
+
+    Two hard-won rules are encoded here.
+
+    1. **Prove it first.** Every engine must show one of its `markers` (e.g.
+       Bing's "pages with this image") before we believe the page holds
+       results. Without this guard, an upload that silently failed to submit
+       leaves us on the engine's *homepage*, and a whole-page link harvest
+       happily returns dozens of trending-topic links that look like real hits.
+       That is precisely how a pipeline ends up "finding" matches that were
+       never search results at all, so a missing marker is a hard failure.
+
+    2. **Harvest before clicking.** Switching to a source-pages view can
+       navigate the page out from under us, so we only click when the current
+       view yielded nothing.
+    """
+    from .browser import click_text, detect_block, scroll_through, settle
+
+    blocked = detect_block(page)
+    if blocked:
+        return EngineResult(engine, ok=False, error=blocked)
+
+    def body_text() -> str:
+        try:
+            return (page.inner_text("body") or "").lower()
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def marker_present() -> bool:
+        if not markers:
+            return True
+        text = body_text()
+        return any(m.lower() in text for m in markers)
+
+    if not marker_present():
+        # Try to switch into the results view the engine hides behind a tab.
+        for label in view_labels:
+            if click_text(page, label, timeout_ms=3500):
+                log.debug("%s: switched view via %r", engine, label)
+                settle(page, 2500)
+                if marker_present():
+                    break
+        if not marker_present():
+            return EngineResult(
+                engine,
+                ok=False,
+                error="results view not reached (query may not have been submitted, "
+                      "or the engine changed its layout)",
+            )
+
+    scroll_through(page, rounds=3)
+
+    rows = SearchEngineAdapter.harvest_anchors(page, containers)
+    candidates = build_candidates(engine, rows, limit)
+    if not candidates:
+        return EngineResult(engine, ok=False, error="no outbound result links found")
+    return EngineResult(engine, candidates=candidates)
 
 
 class SearchEngineAdapter:

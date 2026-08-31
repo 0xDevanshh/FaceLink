@@ -146,8 +146,8 @@ def run(opts: RunOptions, report: Reporter | None = None) -> Case:
         emit(
             "verify:candidate",
             "ok" if vc.verified else "info",
-            f"{vc.domain} img={vc.image_similarity:.2f} face={vc.face_similarity:.2f} "
-            f"score={vc.final_score:.2f} {'VERIFIED' if vc.verified else vc.stages[-1].value}",
+            f"{vc.domain[:24]:<24} img {vc.image_similarity:.2f} face {vc.face_similarity:.2f} "
+            f"score {vc.final_score:.2f} {'VERIFIED' if vc.verified else vc.match_type}",
         )
         if vc.verified:
             break  # one confirmed social match is what the task requires
@@ -239,11 +239,15 @@ def run(opts: RunOptions, report: Reporter | None = None) -> Case:
             case.failure_reason = "; ".join(mismatches)
             emit("readback", "fail", case.failure_reason)
 
-    except (InsufficientFunds, ChainError) as exc:
-        case.blockchain = ChainRecord(mode="failed", note=str(exc))
+    except Exception as exc:  # noqa: BLE001
+        # Local verification already succeeded and is fully recorded on disk;
+        # a chain-side failure must degrade the verdict, not lose the evidence.
+        if not isinstance(exc, (InsufficientFunds, ChainError)):
+            log.exception("unexpected error in blockchain stage")
+        case.blockchain = ChainRecord(mode="failed", note=str(exc)[:500])
         case.verdict = "VERIFIED_OFFCHAIN"
-        case.failure_reason = f"blockchain stage failed: {exc}"
-        emit("chain", "fail", str(exc))
+        case.failure_reason = f"blockchain stage failed: {str(exc)[:300]}"
+        emit("chain", "fail", str(exc)[:300])
 
     writer.write_bundle(case, path)
     return case

@@ -1,12 +1,17 @@
-"""Bing Visual Search adapter (incl. its 'Pages Including This Image' view)."""
+"""Bing Visual Search adapter.
+
+Bing's by-URL entry point lands on a visual-search SERP whose
+"Pages with this image" cards live in `.b_cit_row .cit_cards`; those cards are
+the high-precision source of real page URLs.
+"""
 
 from __future__ import annotations
 
 import logging
 from urllib.parse import quote
 
-from .base import EngineResult, SearchEngineAdapter, build_candidates
-from .browser import attach_file, click_text, detect_block, scroll_through, settle
+from .base import EngineResult, SearchEngineAdapter, collect_results
+from .browser import attach_file, settle
 
 log = logging.getLogger(__name__)
 
@@ -24,12 +29,10 @@ UPLOAD_TRIGGERS = (
     "[aria-label*='Search using an image' i]",
     "[title*='Search using an image' i]",
 )
-RESULT_CONTAINERS = (
-    "div.pageIncludes",
-    "div#insights_results",
-    "div.insights",
-    "main",
-)
+RESULT_CONTAINERS = (".b_cit_row", ".cit_cards", "#insights_results", ".insightsOverlay")
+MARKERS = ("pages with this image", "pages including this image", "visual matches",
+           "related searches", "image results")
+VIEW_LABELS = (r"pages with this image", r"pages including")
 
 
 class BingVisualAdapter(SearchEngineAdapter):
@@ -52,25 +55,17 @@ class BingVisualAdapter(SearchEngineAdapter):
                     if not attach_file(page, image_path, FILE_INPUTS, UPLOAD_TRIGGERS):
                         return EngineResult(self.name, ok=False, query_mode=mode,
                                             error="could not attach file to Bing visual search")
-                settle(page, 3000)
+                settle(page, 3500)
 
-                blocked = detect_block(page)
-                if blocked:
-                    return EngineResult(self.name, ok=False, query_mode=mode, error=blocked)
-
-                for label in (r"pages including", r"pages with this image", r"related searches"):
-                    if click_text(page, label, timeout_ms=3000):
-                        settle(page, 2000)
-                        break
-
-                scroll_through(page, rounds=3)
-                rows = self.harvest_anchors(page, RESULT_CONTAINERS)
-                cands = build_candidates(self.name, rows)
-                if not cands:
-                    return EngineResult(self.name, ok=False, query_mode=mode,
-                                        error="Bing returned no outbound result links")
-                return EngineResult(self.name, candidates=cands, query_mode=mode)
-
+                result = collect_results(
+                    page,
+                    engine=self.name,
+                    containers=RESULT_CONTAINERS,
+                    markers=MARKERS,
+                    view_labels=VIEW_LABELS,
+                )
+                result.query_mode = mode
+                return result
             except Exception as exc:  # noqa: BLE001
                 return EngineResult(self.name, ok=False, query_mode=mode,
                                     error=f"{type(exc).__name__}: {str(exc)[:200]}")

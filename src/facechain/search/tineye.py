@@ -9,14 +9,16 @@ from __future__ import annotations
 
 from urllib.parse import quote
 
-from .base import EngineResult, SearchEngineAdapter, build_candidates
-from .browser import attach_file, detect_block, scroll_through, settle
+from .base import EngineResult, SearchEngineAdapter, collect_results
+from .browser import attach_file, settle
 
 HOME = "https://tineye.com/"
 BY_URL = "https://tineye.com/search?url={url}"
 FILE_INPUTS = ("input[type=file]", "input#upload_box")
 UPLOAD_TRIGGERS = ("button:has-text('Upload')", "label[for='upload_box']")
-RESULT_CONTAINERS = ("div.matches", "div#matches", "main")
+RESULT_CONTAINERS = (".matches", "#matches", "main")
+MARKERS = ("searched over", "results", "matches")
+VIEW_LABELS = ()
 
 
 class TinEyeAdapter(SearchEngineAdapter):
@@ -40,16 +42,16 @@ class TinEyeAdapter(SearchEngineAdapter):
                                             error="could not attach file to TinEye")
                 settle(page, 3000)
 
-                blocked = detect_block(page)
-                if blocked:
-                    return EngineResult(self.name, ok=False, query_mode=mode, error=blocked)
+                result = collect_results(
+                    page,
+                    engine=self.name,
+                    containers=RESULT_CONTAINERS,
+                    markers=MARKERS,
+                    view_labels=VIEW_LABELS,
+                )
+                result.query_mode = mode
+                return result
 
-                scroll_through(page, rounds=2)
-                cands = build_candidates(self.name, self.harvest_anchors(page, RESULT_CONTAINERS))
-                if not cands:
-                    return EngineResult(self.name, ok=False, query_mode=mode,
-                                        error="TinEye returned no matches")
-                return EngineResult(self.name, candidates=cands, query_mode=mode)
             except Exception as exc:  # noqa: BLE001
                 return EngineResult(self.name, ok=False, query_mode=mode,
                                     error=f"{type(exc).__name__}: {str(exc)[:200]}")
