@@ -1,12 +1,12 @@
-"""Base Sepolia + Ethereum Attestation Service client.
+"""Ethereum Sepolia + Ethereum Attestation Service client.
 
-Why Base Sepolia: a real, public, EVM L2 testnet (chain id 84532) with free
-faucet ETH, ~2s blocks, and a working block explorer — so the record is
-genuinely on a blockchain while the demo costs nothing.
+Why Ethereum Sepolia: a public EVM testnet (chain id 11155111) with free
+faucet ETH and a working block explorer — so the record is genuinely on a
+blockchain while the demo costs nothing.
 
 Why EAS instead of a bespoke Solidity contract: EAS is a permissionless,
 already-audited attestation registry deployed at the canonical predeploy
-addresses on Base Sepolia. It gives exactly what the task asks for — a
+addresses on Sepolia. It gives exactly what the task asks for — a
 tamper-evident, independently readable record — with no contract of our own to
 deploy, verify or trust.
 """
@@ -22,7 +22,6 @@ from web3 import Web3
 from web3.logs import DISCARD
 
 from ..config import (
-    BASE_SEPOLIA_CHAIN_ID,
     EAS_CONTRACT,
     EAS_SCHEMA_DEFINITION,
     EASSCAN_ATTESTATION,
@@ -30,6 +29,7 @@ from ..config import (
     EXPLORER_TX,
     FALLBACK_RPCS,
     SCHEMA_REGISTRY_CONTRACT,
+    SEPOLIA_CHAIN_ID,
     settings,
 )
 from ..evidence.hashing import hex0x, sha256_text
@@ -42,10 +42,10 @@ log = logging.getLogger(__name__)
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 ZERO_BYTES32 = "0x" + "00" * 32
 FAUCET_HINT = (
-    "Fund the attester with free Base Sepolia ETH:\n"
-    "  • https://portal.cdp.coinbase.com/products/faucet  (Base Sepolia, 0.1 ETH/day)\n"
-    "  • https://www.alchemy.com/faucets/base-sepolia\n"
-    "  • bridge Sepolia ETH via https://superbridge.app/base-sepolia"
+    "Fund the attester with free Sepolia ETH:\n"
+    "  • https://cloud.google.com/application/web3/faucet/ethereum/sepolia\n"
+    "  • https://sepoliafaucet.com\n"
+    "  • https://www.alchemy.com/faucets/ethereum-sepolia"
 )
 
 
@@ -104,7 +104,7 @@ class EasClient:
             try:
                 w3 = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 30}))
                 chain_id = w3.eth.chain_id
-                if chain_id != BASE_SEPOLIA_CHAIN_ID:
+                if chain_id != SEPOLIA_CHAIN_ID:
                     errors.append(f"{url}: wrong chain id {chain_id}")
                     continue
                 if url != primary:
@@ -113,7 +113,7 @@ class EasClient:
                 return w3
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"{url}: {type(exc).__name__}: {str(exc)[:120]}")
-        raise ChainError("cannot reach Base Sepolia. Tried:\n  " + "\n  ".join(errors))
+        raise ChainError("cannot reach Ethereum Sepolia. Tried:\n  " + "\n  ".join(errors))
 
     @property
     def address(self) -> str:
@@ -128,7 +128,7 @@ class EasClient:
         bal = self.balance_eth()
         if bal < min_eth:
             raise InsufficientFunds(
-                f"attester {self.address} holds {bal:.6f} ETH on Base Sepolia; "
+                f"attester {self.address} holds {bal:.6f} ETH on Ethereum Sepolia; "
                 f"need ~{min_eth} ETH.\n{FAUCET_HINT}"
             )
         return bal
@@ -228,7 +228,7 @@ class EasClient:
         """
         if not self._schema_exists(schema):
             raise ChainError(
-                f"schema {schema} is not registered on Base Sepolia yet — "
+                f"schema {schema} is not registered on Ethereum Sepolia yet — "
                 "run `python scripts/register_schema.py` (one-off, needs faucet ETH). "
                 "Simulation cannot proceed without a registered schema."
             )
@@ -317,7 +317,7 @@ class EasClient:
             {
                 "from": sender,
                 "nonce": self.w3.eth.get_transaction_count(sender),
-                "chainId": BASE_SEPOLIA_CHAIN_ID,
+                "chainId": SEPOLIA_CHAIN_ID,
                 "gas": max(gas, 60_000),
                 "maxPriorityFeePerGas": tip,
                 "maxFeePerGas": int(base_fee * 2) + tip,
