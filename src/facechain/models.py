@@ -110,8 +110,8 @@ class VerifiedCandidate(BaseModel):
 
 
 class ChainRecord(BaseModel):
-    network: str = "Base Sepolia"
-    chain_id: int = 84532
+    network: str = "Ethereum Sepolia"
+    chain_id: int = 11155111
     eas_contract: str = ""
     schema_uid: str = ""
     schema_definition: str = ""

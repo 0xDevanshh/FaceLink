@@ -76,7 +76,7 @@ def header() -> None:
         Panel(
             Text.from_markup(
                 "[bold white]FACECHAIN VERIFICATION PIPELINE[/bold white]\n"
-                f"[dim]v{PIPELINE_VERSION} • Base Sepolia testnet • EAS attestations[/dim]",
+                f"[dim]v{PIPELINE_VERSION} • Ethereum Sepolia testnet • EAS attestations[/dim]",
                 justify="center",
             ),
             border_style="cyan",

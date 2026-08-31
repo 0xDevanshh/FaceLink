@@ -11,19 +11,19 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # ---------------------------------------------------------------------------
-# Base Sepolia + EAS constants (canonical predeploy addresses)
+# Ethereum Sepolia + EAS constants
 # ---------------------------------------------------------------------------
-BASE_SEPOLIA_CHAIN_ID = 84532
-EAS_CONTRACT = "0x4200000000000000000000000000000000000021"
-SCHEMA_REGISTRY_CONTRACT = "0x4200000000000000000000000000000000000020"
-EXPLORER_TX = "https://sepolia.basescan.org/tx/{tx}"
-EASSCAN_ATTESTATION = "https://base-sepolia.easscan.org/attestation/view/{uid}"
-EASSCAN_SCHEMA = "https://base-sepolia.easscan.org/schema/view/{uid}"
+SEPOLIA_CHAIN_ID = 11155111
+EAS_CONTRACT = "0x0000000000000000000000000000000000000021"
+SCHEMA_REGISTRY_CONTRACT = "0x0000000000000000000000000000000000000020"
+EXPLORER_TX = "https://sepolia.etherscan.io/tx/{tx}"
+EASSCAN_ATTESTATION = "https://sepolia.easscan.org/attestation/view/{uid}"
+EASSCAN_SCHEMA = "https://sepolia.easscan.org/schema/view/{uid}"
 
 FALLBACK_RPCS = (
-    "https://sepolia.base.org",
-    "https://base-sepolia-rpc.publicnode.com",
-    "https://base-sepolia.drpc.org",
+    "https://ethereum-sepolia-rpc.publicnode.com",
+    "https://rpc.sepolia.org",
+    "https://sepolia.gateway.tenderly.co",
 )
 
 # The on-chain schema. Order matters: it is part of the schema UID.
@@ -72,7 +72,7 @@ class Settings(BaseSettings):
     )
 
     # ---- blockchain -------------------------------------------------------
-    base_sepolia_rpc_url: str = "https://sepolia.base.org"
+    base_sepolia_rpc_url: str = "https://ethereum-sepolia-rpc.publicnode.com"
     private_key: str = ""
     eas_schema_uid: str = ""
     attestation_recipient: str = "0x0000000000000000000000000000000000000000"
