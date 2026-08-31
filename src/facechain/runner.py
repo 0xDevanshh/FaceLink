@@ -23,7 +23,7 @@ from .evidence.hashing import sha256_file
 from .evidence.writer import EvidenceWriter, new_case_id
 from .face.encoder import crop_face, encode_face, read_image
 from .face.detector import select_primary
-from .models import Case, ChainRecord, InputImage, Stage, VerifiedCandidate
+from .models import Case, ChainRecord, InputImage, VerifiedCandidate
 from .search.orchestrator import run_reverse_search
 from .verification.candidate import verify_candidate
 from .verification.image_similarity import perceptual_hashes

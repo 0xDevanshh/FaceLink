@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 from urllib.parse import quote
 
-from ..config import settings
 from .base import EngineResult, SearchEngineAdapter, collect_results
 from .browser import attach_file, settle
 

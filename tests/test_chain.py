@@ -143,3 +143,11 @@ def test_unknown_revert_still_surfaces_detail():
 def test_known_error_selectors_are_well_formed():
     for selector in EAS_ERRORS:
         assert selector.startswith("0x") and len(selector) == 10
+
+
+def test_build_fields_preserves_the_payloads_own_pipeline_version():
+    """Regression: re-deriving fields from an old bundle must reproduce what was
+    attested then, not stamp the currently-running version."""
+    old = payload()
+    old.pipeline_version = "0.9.0-old"
+    assert EasClient.build_fields(old, "ee" * 32)["pipelineVersion"] == "0.9.0-old"

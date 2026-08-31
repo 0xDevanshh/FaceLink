@@ -21,7 +21,6 @@ from eth_account import Account
 from web3 import Web3
 from web3.logs import DISCARD
 
-from .. import PIPELINE_VERSION
 from ..config import (
     BASE_SEPOLIA_CHAIN_ID,
     EAS_CONTRACT,
@@ -202,7 +201,10 @@ class EasClient:
             "socialPlatform": payload.social_platform,
             "matchScoreBps": int(round(payload.match_score * 10_000)),
             "observedAt": int(payload.observed_at),
-            "pipelineVersion": PIPELINE_VERSION,
+            # The payload's own version, never the running one: re-deriving the
+            # fields from an older bundle must reproduce what was attested then,
+            # or the independent verifier reports a mismatch that never happened.
+            "pipelineVersion": payload.pipeline_version,
         }
 
     def _request(self, schema: str, data: bytes, recipient: str | None) -> tuple:
