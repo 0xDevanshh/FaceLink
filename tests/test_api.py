@@ -82,11 +82,10 @@ def test_upload_rejects_bad_magic(client):
 
 def test_upload_accepts_valid_jpeg(client):
     """Valid JPEG magic bytes should pass validation and reach the pipeline."""
-    with patch("server._run_pipeline_background"):
+    with patch("server._launch"):
         r = client.post("/api/v1/scan",
                         files={"image": ("face.jpg", _jpeg_bytes(500), "image/jpeg")},
                         data={"no_chain": "true"})
-    # Should be accepted (202 or 200) — pipeline runs async.
     assert r.status_code == 200
     body = r.json()
     assert "case_id" in body
@@ -94,7 +93,7 @@ def test_upload_accepts_valid_jpeg(client):
 
 
 def test_upload_accepts_valid_png(client):
-    with patch("server._run_pipeline_background"):
+    with patch("server._launch"):
         r = client.post("/api/v1/scan",
                         files={"image": ("face.png", _png_bytes(), "image/png")},
                         data={"no_chain": "true"})

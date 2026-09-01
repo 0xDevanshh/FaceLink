@@ -3,8 +3,10 @@
 
     uvicorn server:app --reload --host 0.0.0.0 --port 8000
 
-Wraps the existing pipeline programmatically — CLI and UI share identical
-stage logic and evidence generation. The server never subprocesses pipeline.py.
+The pipeline runs in a ThreadPoolExecutor. Events are appended to a plain
+list by the worker thread (GIL protects list.append). The SSE generator
+tail-follows that list by index — no asyncio.Queue, no call_soon_threadsafe,
+no thread-safety bugs.
 """
 
 from __future__ import annotations
@@ -27,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import Response
 from sse_starlette.sse import EventSourceResponse
 
 from facechain.config import settings
@@ -35,7 +37,6 @@ from facechain.runner import PipelineError, RunOptions, run
 from facechain.security.paths import PathTraversalError, safe_case_id
 from facechain.security.scrubber import install as install_scrubber, scrub
 
-# ---- startup -------------------------------------------------------------
 install_scrubber()
 
 logging.basicConfig(
@@ -45,94 +46,79 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ---- constants -----------------------------------------------------------
+# ── constants ─────────────────────────────────────────────────────────────────
 MAX_UPLOAD_BYTES = settings.api_upload_max_mb * 1024 * 1024
 ALLOWED_MIME = {"image/jpeg", "image/png", "image/webp", "image/gif", "image/bmp", "image/avif"}
-# Magic bytes for supported image formats.
-MAGIC = {
-    b"\xff\xd8\xff": "image/jpeg",
-    b"\x89PNG": "image/png",
-    b"RIFF": "image/webp",  # partial — also need to check offset 8
-    b"GIF8": "image/gif",
-    b"GIF9": "image/gif",
-    b"BM": "image/bmp",
-    b"\x00\x00\x00": "image/avif",  # ftyp box — partial check only
-}
+
+# Windows-safe upload dir (no /tmp)
+_UPLOAD_DIR = Path(os.environ.get(
+    "FACECHAIN_UPLOAD_DIR",
+    str(Path(__file__).parent / "_uploads"),
+))
+
 _SEMAPHORE: asyncio.Semaphore | None = None
 
 
-# ---- job registry --------------------------------------------------------
+# ── job ───────────────────────────────────────────────────────────────────────
 class JobStatus:
-    QUEUED = "queued"
+    QUEUED  = "queued"
     RUNNING = "running"
-    DONE = "done"
-    FAILED = "failed"
+    DONE    = "done"
+    FAILED  = "failed"
 
 
 class Job:
+    """
+    Events are appended to `self.events` by the worker thread.
+    Python's GIL makes list.append() atomic enough for our read/write pattern
+    (one writer thread, many reader coroutines that only read by index).
+    SSE generators tail-follow by keeping a local cursor into this list.
+    """
     def __init__(self, case_id: str, image_path: Path, opts: RunOptions) -> None:
-        self.case_id = case_id
+        self.case_id    = case_id
         self.image_path = image_path
-        self.opts = opts
-        self.status = JobStatus.QUEUED
-        self.events: list[dict[str, str]] = []
-        self.result: dict[str, Any] | None = None
-        self.error: str | None = None
-        self.created_at = time.time()
-        self._waiters: list[asyncio.Queue] = []
+        self.opts       = opts
+        self.status     = JobStatus.QUEUED
+        self.events: list[dict]    = []   # append-only, GIL-safe
+        self.result: dict | None   = None
+        self.error:  str  | None   = None
+        self.created_at            = time.monotonic()
 
+    # Called from the worker thread — just append.
     def push(self, stage: str, status: str, detail: str) -> None:
-        evt = {"stage": scrub(stage), "status": status, "detail": scrub(detail),
-               "ts": datetime.now(timezone.utc).isoformat()}
-        self.events.append(evt)
-        for q in self._waiters:
-            q.put_nowait(evt)
-
-    def subscribe(self) -> asyncio.Queue:
-        q: asyncio.Queue = asyncio.Queue()
-        self._waiters.append(q)
-        # Replay existing events.
-        for evt in self.events:
-            q.put_nowait(evt)
-        return q
-
-    def unsubscribe(self, q: asyncio.Queue) -> None:
-        try:
-            self._waiters.remove(q)
-        except ValueError:
-            pass
+        self.events.append({
+            "stage":  scrub(stage),
+            "status": status,
+            "detail": scrub(detail),
+            "ts":     datetime.now(timezone.utc).isoformat(),
+        })
 
 
 _jobs: dict[str, Job] = {}
-_upload_dir = Path(os.environ.get("FACECHAIN_UPLOAD_DIR", "/tmp/facechain_uploads"))
 
 
 def _cleanup_jobs() -> None:
-    now = time.time()
-    stale = [k for k, j in _jobs.items() if now - j.created_at > settings.api_job_ttl_s]
+    cutoff = time.monotonic() - settings.api_job_ttl_s
+    stale  = [k for k, j in _jobs.items() if j.created_at < cutoff]
     for k in stale:
-        try:
-            _jobs[k].image_path.unlink(missing_ok=True)
-        except Exception:
-            pass
+        try: _jobs[k].image_path.unlink(missing_ok=True)
+        except Exception: pass  # noqa: BLE001
         del _jobs[k]
 
 
+# ── lifespan ──────────────────────────────────────────────────────────────────
 @asynccontextmanager
-async def lifespan(app_: FastAPI) -> AsyncIterator[None]:
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     global _SEMAPHORE
-    _upload_dir.mkdir(parents=True, exist_ok=True)
+    _UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     _SEMAPHORE = asyncio.Semaphore(settings.api_max_concurrent_scans)
     yield
-    # Cleanup on shutdown.
-    for job in _jobs.values():
-        try:
-            job.image_path.unlink(missing_ok=True)
-        except Exception:
-            pass
+    for j in _jobs.values():
+        try: j.image_path.unlink(missing_ok=True)
+        except Exception: pass  # noqa: BLE001
 
 
-# ---- app -----------------------------------------------------------------
+# ── app ───────────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="FaceChain API",
     version="1.0.0",
@@ -149,76 +135,71 @@ app.add_middleware(
 )
 
 
-# ---- helpers -------------------------------------------------------------
-
+# ── upload validation ─────────────────────────────────────────────────────────
 def _check_magic(data: bytes) -> bool:
-    """Validate image magic bytes (not just MIME header)."""
-    if len(data) < 4:
-        return False
-    # JPEG: FF D8 FF
-    if data[:3] == b"\xff\xd8\xff":
-        return True
-    # PNG: 89 50 4E 47 0D 0A 1A 0A
-    if data[:4] == b"\x89PNG":
-        return True
-    # WebP: RIFF????WEBP
-    if data[:4] == b"RIFF" and len(data) >= 12 and data[8:12] == b"WEBP":
-        return True
-    # GIF87a / GIF89a
-    if data[:4] in (b"GIF8", b"GIF9"):
-        return True
-    # BMP: BM
-    if data[:2] == b"BM":
-        return True
+    if len(data) < 4:                                                return False
+    if data[:3] == b"\xff\xd8\xff":                                  return True  # JPEG
+    if data[:4] == b"\x89PNG":                                       return True  # PNG
+    if data[:4] == b"RIFF" and len(data) >= 12 and data[8:12] == b"WEBP": return True  # WebP
+    if data[:4] in (b"GIF8", b"GIF9"):                               return True  # GIF
+    if data[:2] == b"BM":                                            return True  # BMP
     return False
 
 
 def _validate_upload(file: UploadFile, data: bytes) -> None:
     if len(data) > MAX_UPLOAD_BYTES:
-        raise HTTPException(413, f"File too large: max {settings.api_upload_max_mb}MB")
+        raise HTTPException(413, f"File too large: max {settings.api_upload_max_mb} MB")
     mime = (file.content_type or "").split(";")[0].strip().lower()
     if mime not in ALLOWED_MIME:
-        raise HTTPException(415, f"Unsupported content type: {mime}")
+        raise HTTPException(415, f"Unsupported content type: {mime!r}")
     if not _check_magic(data):
         raise HTTPException(422, "File magic bytes do not match a supported image format")
 
 
+# ── pipeline worker ───────────────────────────────────────────────────────────
 def _run_pipeline_sync(job: Job) -> None:
-    """Run the pipeline in a thread (called via run_in_executor)."""
-    def reporter(stage: str, status: str, detail: str) -> None:
-        job.push(stage, status, detail)
-
+    """Runs in a thread. Calls job.push() which is GIL-safe."""
     try:
-        case = run(job.opts, reporter)
+        case = run(job.opts, job.push)
         job.result = case.model_dump(mode="json")
         job.status = JobStatus.DONE
         job.push("done", "ok", f"verdict={case.verdict}")
     except PipelineError as exc:
         job.status = JobStatus.FAILED
-        job.error = str(exc)
+        job.error  = str(exc)
         job.push("error", "fail", str(exc))
-    except Exception as exc:
-        log.exception("unexpected pipeline error for case %s", job.case_id)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("pipeline error for %s", job.case_id)
         job.status = JobStatus.FAILED
-        job.error = f"internal error: {type(exc).__name__}"
+        job.error  = f"{type(exc).__name__}: {exc}"
         job.push("error", "fail", job.error)
 
 
-# ---- routes --------------------------------------------------------------
+async def _launch(case_id: str) -> None:
+    job = _jobs.get(case_id)
+    if not job:
+        return
+    assert _SEMAPHORE
+    async with _SEMAPHORE:
+        job.status = JobStatus.RUNNING
+        await asyncio.get_event_loop().run_in_executor(None, _run_pipeline_sync, job)
+
+
+# ── routes ────────────────────────────────────────────────────────────────────
 
 @app.get("/api/v1/health")
 async def health() -> dict:
     from facechain import PIPELINE_VERSION
     return {
-        "status": "ok",
+        "status":  "ok",
         "version": PIPELINE_VERSION,
         "engines_configured": {
-            "serpapi": bool(settings.serpapi_key),
-            "facecheck": bool(settings.facecheck_api_key),
+            "serpapi":      bool(settings.serpapi_key),
+            "facecheck":    bool(settings.facecheck_api_key),
             "search4faces": bool(settings.search4faces_api_key),
-            "upload_host": settings.allow_upload_host,
+            "upload_host":  settings.allow_upload_host,
         },
-        "face_backend": settings.face_backend,
+        "face_backend":      settings.face_backend,
         "chain_mode_default": "skip",
     }
 
@@ -226,16 +207,16 @@ async def health() -> dict:
 @app.post("/api/v1/scan")
 async def start_scan(
     background_tasks: BackgroundTasks,
-    image: UploadFile = File(...),
-    engines: str = Form(default=""),
-    chain_mode: str = Form(default="skip"),
-    max_verify: int = Form(default=0),
+    image:            UploadFile = File(...),
+    engines:          str = Form(default=""),
+    chain_mode:       str = Form(default="skip"),
+    max_verify:       int = Form(default=0),
     user_declaration: str = Form(default="false"),
-    no_chain: str = Form(default="true"),
+    no_chain:         str = Form(default="true"),
 ) -> dict:
     _cleanup_jobs()
 
-    _no_chain = no_chain.lower() in ("true", "1", "yes")
+    _no_chain  = no_chain.lower() in ("true", "1", "yes")
     _user_decl = user_declaration.lower() in ("true", "1", "yes")
 
     if len(_jobs) >= settings.api_max_concurrent_scans * 4:
@@ -244,12 +225,14 @@ async def start_scan(
     data = await image.read()
     _validate_upload(image, data)
 
-    case_id = f"case_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
-    img_path = _upload_dir / f"{case_id}{Path(image.filename or 'upload.jpg').suffix or '.jpg'}"
+    ts      = datetime.now(timezone.utc)
+    case_id = f"case_{ts.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    suffix  = Path(image.filename or "upload.jpg").suffix or ".jpg"
+    img_path = _UPLOAD_DIR / f"{case_id}{suffix}"
     img_path.write_bytes(data)
 
     engine_list = [e.strip() for e in engines.split(",") if e.strip()] or None
-    mode = "skip" if _no_chain else chain_mode
+    mode        = "skip" if _no_chain else chain_mode
 
     opts = RunOptions(
         image=str(img_path),
@@ -260,88 +243,85 @@ async def start_scan(
     )
     job = Job(case_id=case_id, image_path=img_path, opts=opts)
     if _user_decl:
-        job.push("declaration", "info", "user_declaration=true recorded in job")
+        job.push("declaration", "info", "user_declaration=true")
     _jobs[case_id] = job
 
-    background_tasks.add_task(_run_pipeline_background, case_id)
+    background_tasks.add_task(_launch, case_id)
 
     return {
-        "case_id": case_id,
+        "case_id":    case_id,
         "status_url": f"/api/v1/scan/{case_id}/status",
         "events_url": f"/api/v1/scan/{case_id}/events",
         "result_url": f"/api/v1/scan/{case_id}/result",
     }
 
 
-async def _run_pipeline_background(case_id: str) -> None:
-    job = _jobs.get(case_id)
-    if not job:
-        return
-    assert _SEMAPHORE is not None
-    async with _SEMAPHORE:
-        job.status = JobStatus.RUNNING
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, _run_pipeline_sync, job)
-
-
 @app.get("/api/v1/scan/{case_id}/status")
 async def scan_status(case_id: str) -> dict:
-    try:
-        safe_case_id(case_id)
-    except PathTraversalError:
-        raise HTTPException(400, "invalid case_id")
+    try:    safe_case_id(case_id)
+    except PathTraversalError: raise HTTPException(400, "invalid case_id")
     job = _jobs.get(case_id)
-    if not job:
-        raise HTTPException(404, "case not found")
+    if not job: raise HTTPException(404, "case not found")
     return {
-        "case_id": case_id,
-        "status": job.status,
+        "case_id":     case_id,
+        "status":      job.status,
         "event_count": len(job.events),
-        "error": job.error,
+        "error":       job.error,
     }
 
 
 @app.get("/api/v1/scan/{case_id}/events")
 async def scan_events(request: Request, case_id: str) -> EventSourceResponse:
-    try:
-        safe_case_id(case_id)
-    except PathTraversalError:
-        raise HTTPException(400, "invalid case_id")
+    """
+    Tail-follow job.events by index.  No queues, no thread-safety issues.
+    Works even if the pipeline finishes before the SSE client connects
+    (it will stream the whole backlog immediately then close).
+    """
+    try:    safe_case_id(case_id)
+    except PathTraversalError: raise HTTPException(400, "invalid case_id")
     job = _jobs.get(case_id)
-    if not job:
-        raise HTTPException(404, "case not found")
+    if not job: raise HTTPException(404, "case not found")
 
-    async def generator():
-        q = job.subscribe()
-        try:
-            while True:
-                if await request.is_disconnected():
-                    break
-                try:
-                    evt = await asyncio.wait_for(q.get(), timeout=1.0)
+    async def _gen():
+        cursor = 0
+        while True:
+            # Drain everything buffered so far
+            snapshot = job.events          # reference; list grows, never shrinks
+            while cursor < len(snapshot):
+                evt = snapshot[cursor]
+                cursor += 1
+                yield {"data": json.dumps(evt)}
+                if evt.get("stage") in ("done", "error"):
+                    return
+
+            # Are we done?
+            if job.status in (JobStatus.DONE, JobStatus.FAILED):
+                # Drain one last time (race: status set just after snapshot)
+                snapshot = job.events
+                while cursor < len(snapshot):
+                    evt = snapshot[cursor]
+                    cursor += 1
                     yield {"data": json.dumps(evt)}
-                    if evt.get("stage") in ("done", "error"):
-                        break
-                except asyncio.TimeoutError:
-                    if job.status in (JobStatus.DONE, JobStatus.FAILED):
-                        break
-                    yield {"data": json.dumps({"stage": "ping", "status": "ok", "detail": ""})}
-        finally:
-            job.unsubscribe(q)
+                return
 
-    return EventSourceResponse(generator())
+            # Client disconnected?
+            if await request.is_disconnected():
+                return
+
+            # Nothing new yet — yield a keepalive and wait
+            yield {"data": json.dumps({"stage": "ping", "status": "ok", "detail": ""})}
+            await asyncio.sleep(0.4)   # poll every 400 ms — fast enough, not spammy
+
+    return EventSourceResponse(_gen())
 
 
 @app.get("/api/v1/scan/{case_id}/result")
 async def scan_result(case_id: str) -> dict:
-    try:
-        safe_case_id(case_id)
-    except PathTraversalError:
-        raise HTTPException(400, "invalid case_id")
+    try:    safe_case_id(case_id)
+    except PathTraversalError: raise HTTPException(400, "invalid case_id")
     job = _jobs.get(case_id)
-    if not job:
-        raise HTTPException(404, "case not found")
-    if job.status == JobStatus.QUEUED or job.status == JobStatus.RUNNING:
+    if not job: raise HTTPException(404, "case not found")
+    if job.status in (JobStatus.QUEUED, JobStatus.RUNNING):
         raise HTTPException(202, "scan still in progress")
     if job.status == JobStatus.FAILED:
         raise HTTPException(500, job.error or "pipeline failed")
@@ -350,29 +330,21 @@ async def scan_result(case_id: str) -> dict:
 
 @app.get("/api/v1/scan/{case_id}/evidence")
 async def scan_evidence(case_id: str) -> Response:
-    try:
-        safe_case_id(case_id)
-    except PathTraversalError:
-        raise HTTPException(400, "invalid case_id")
-
-    evidence_path = Path(settings.evidence_dir) / case_id
-    if not evidence_path.exists():
-        raise HTTPException(404, "evidence not found")
+    try:    safe_case_id(case_id)
+    except PathTraversalError: raise HTTPException(400, "invalid case_id")
+    ep = Path(settings.evidence_dir) / case_id
+    if not ep.exists(): raise HTTPException(404, "evidence not found")
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for fp in sorted(evidence_path.rglob("*")):
-            if fp.is_file():
-                arcname = fp.relative_to(evidence_path.parent)
-                zf.write(fp, arcname)
-        # Add a checksums file.
         from facechain.evidence.hashing import sha256_file
-        lines = []
-        for fp in sorted(evidence_path.rglob("*")):
+        lines: list[str] = []
+        for fp in sorted(ep.rglob("*")):
             if fp.is_file():
-                lines.append(f"{sha256_file(fp)}  {fp.relative_to(evidence_path.parent)}")
+                arc = fp.relative_to(ep.parent)
+                zf.write(fp, arc)
+                lines.append(f"{sha256_file(fp)}  {arc}")
         zf.writestr(f"{case_id}/CHECKSUMS.sha256", "\n".join(lines))
-
     buf.seek(0)
     return Response(
         content=buf.read(),
@@ -383,48 +355,47 @@ async def scan_evidence(case_id: str) -> Response:
 
 @app.post("/api/v1/verify")
 async def verify_evidence_upload(evidence_zip: UploadFile = File(...)) -> dict:
-    """Accept an uploaded evidence ZIP, run the independent verifier, return per-field report."""
     data = await evidence_zip.read()
     if len(data) > 50 * 1024 * 1024:
-        raise HTTPException(413, "Evidence ZIP too large (max 50MB)")
+        raise HTTPException(413, "Evidence ZIP too large (max 50 MB)")
 
     import tempfile
+    import json as _json
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
-            # Sanitize extraction paths.
-            for member in zf.namelist():
-                if ".." in member or member.startswith("/"):
-                    raise HTTPException(422, f"Unsafe path in ZIP: {member}")
-                zf.extract(member, tmp_path)
+            for m in zf.namelist():
+                if ".." in m or m.startswith("/"):
+                    raise HTTPException(422, f"Unsafe path in ZIP: {m}")
+                zf.extract(m, tmp_path)
 
-        # Find the case directory.
-        case_dirs = [d for d in tmp_path.iterdir() if d.is_dir() and d.name.startswith("case_")]
-        if not case_dirs:
-            raise HTTPException(422, "No case_* directory found in ZIP")
-        case_dir = case_dirs[0]
+        dirs = [d for d in tmp_path.iterdir() if d.is_dir() and d.name.startswith("case_")]
+        if not dirs: raise HTTPException(422, "No case_* directory in ZIP")
+        case_dir = dirs[0]
 
-        from facechain.evidence.writer import verify_bundle_integrity
-        from facechain.evidence.hashing import sha256_canonical, sha256_text, sha256_file
-        import json as _json
+        from facechain.evidence.writer  import verify_bundle_integrity
+        from facechain.evidence.hashing import sha256_canonical, sha256_text
 
         passed, problems = verify_bundle_integrity(case_dir)
         checks: list[dict] = []
 
-        case_path = case_dir / "case.json"
-        if case_path.exists():
-            case_data = _json.loads(case_path.read_text())
-            payload_path = case_dir / "attested_payload.json"
-            if payload_path.exists():
-                payload = _json.loads(payload_path.read_text())
-                ev_hash = sha256_canonical(payload)
+        cp = case_dir / "case.json"
+        if cp.exists():
+            cd = _json.loads(cp.read_text())
+            pp = case_dir / "attested_payload.json"
+            if pp.exists():
+                payload  = _json.loads(pp.read_text())
+                ev_hash  = sha256_canonical(payload)
                 checks.append({
-                    "check": "evidenceHash recomputed",
-                    "passed": ev_hash == case_data.get("evidence_sha256"),
+                    "check":  "evidenceHash recomputed",
+                    "passed": ev_hash == cd.get("evidence_sha256"),
                     "detail": f"sha256:{ev_hash[:24]}…",
                 })
-                url_hash_ok = sha256_text(payload.get("matched_url", "")) == payload.get("matched_url_sha256", "")
-                checks.append({"check": "matched_url hash consistent", "passed": url_hash_ok})
+                checks.append({
+                    "check":  "matched_url hash consistent",
+                    "passed": sha256_text(payload.get("matched_url", ""))
+                              == payload.get("matched_url_sha256", ""),
+                })
 
         for p in problems:
             checks.append({"check": "bundle integrity", "passed": False, "detail": p})
@@ -433,7 +404,7 @@ async def verify_evidence_upload(evidence_zip: UploadFile = File(...)) -> dict:
 
         return {
             "overall": "PASS" if passed and all(c["passed"] for c in checks) else "FAIL",
-            "checks": checks,
+            "checks":  checks,
         }
 
 
