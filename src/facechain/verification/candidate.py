@@ -28,6 +28,7 @@ from ..face.encoder import decode_image
 from ..face.detector import load_backend
 from ..face.similarity import best_cosine
 from ..models import SearchCandidate, VerifiedCandidate
+from ..security.ssrf import SSRFViolation, safe_url_or_none
 from .image_similarity import compare, perceptual_hashes
 from .social import metadata_consistency
 
@@ -35,20 +36,53 @@ log = logging.getLogger(__name__)
 
 MIN_IMAGE_BYTES = 3000  # skip tracking pixels, spacers, icons
 MAX_IMAGE_BYTES = 25 * 1024 * 1024
+MAX_PAGE_BYTES = 10 * 1024 * 1024
 SKIP_IMAGE_HINTS = ("sprite", "logo", "icon", "avatar_default", "favicon",
                     "placeholder", "blank", "1x1", "spacer")
+CONTENT_TYPE_ALLOWLIST = ("image/jpeg", "image/png", "image/webp", "image/avif",
+                          "image/gif", "image/bmp")
 
 
 def _client() -> httpx.Client:
     return httpx.Client(
-        follow_redirects=True,
-        timeout=settings.http_timeout_s,
+        follow_redirects=False,  # we handle redirects manually for SSRF re-validation
+        timeout=httpx.Timeout(connect=5.0, read=15.0, write=5.0, pool=5.0),
         headers={
             "User-Agent": settings.user_agent,
             "Accept": "text/html,application/xhtml+xml,image/avif,image/webp,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
         },
+        max_redirects=0,
     )
+
+
+def _safe_get(client: httpx.Client, url: str, max_redirects: int = 3) -> tuple[httpx.Response | None, str]:
+    """SSRF-safe GET with per-hop IP re-validation.
+
+    Returns (response, final_url). If any hop fails SSRF checks or exhausts
+    redirects, returns (None, url) with the reason logged.
+    """
+    current = url
+    for hop in range(max_redirects + 1):
+        safe = safe_url_or_none(current)
+        if safe is None:
+            return None, current
+        try:
+            resp = client.get(safe, follow_redirects=False)
+        except Exception as exc:
+            log.debug("fetch error %s: %s", current, exc)
+            return None, current
+        if resp.is_redirect:
+            location = resp.headers.get("location", "")
+            if not location:
+                return None, current
+            if not location.startswith(("http://", "https://")):
+                location = urljoin(current, location)
+            current = location
+            continue
+        return resp, current
+    log.debug("too many redirects for %s", url)
+    return None, current
 
 
 def _jsonld_images(soup: BeautifulSoup) -> list[str]:
@@ -126,15 +160,21 @@ def extract_image_urls(html: str, page_url: str) -> list[tuple[str, str]]:
 
 
 def _download_image(client: httpx.Client, url: str, referer: str | None = None) -> bytes | None:
+    """SSRF-safe image download with content-type and size validation."""
+    safe = safe_url_or_none(url)
+    if safe is None:
+        return None
     try:
-        headers = {"Referer": referer} if referer else {}
-        resp = client.get(url, headers=headers)
-        if resp.status_code != 200:
+        resp, _ = _safe_get(client, safe)
+        if resp is None or resp.status_code != 200:
             return None
-        ctype = resp.headers.get("content-type", "")
+        ctype = resp.headers.get("content-type", "").split(";")[0].strip().lower()
+        # Accept if content-type is image OR URL looks like image file.
+        if ctype not in CONTENT_TYPE_ALLOWLIST and not re.search(
+            r"\.(jpe?g|png|webp|avif|gif|bmp)(\?|$)", url, re.I
+        ):
+            return None
         data = resp.content
-        if "image" not in ctype and not re.search(r"\.(jpe?g|png|webp|avif)", url, re.I):
-            return None
         if not (MIN_IMAGE_BYTES <= len(data) <= MAX_IMAGE_BYTES):
             return None
         return data
@@ -157,17 +197,31 @@ def verify_candidate(
         is_social=candidate.is_social,
     )
 
+    # SSRF check the candidate URL before fetching.
+    if safe_url_or_none(candidate.url) is None:
+        vc.fetch_note = "SSRF: rejected (private/loopback/invalid address)"
+        vc.rejection_reason = "URL failed SSRF safety check"
+        return vc
+
     image_targets: list[tuple[str, str]] = []
     with _client() as client:
-        # 1. the page itself
+        # 1. the page itself — SSRF-safe with per-hop re-validation
         try:
-            resp = client.get(candidate.url)
-            if resp.status_code == 200 and "html" in resp.headers.get("content-type", ""):
-                vc.fetched = True
-                image_targets = extract_image_urls(resp.text, str(resp.url))
-                vc.fetch_note = f"HTTP 200, {len(image_targets)} image refs"
-            else:
+            resp, final_url = _safe_get(client, candidate.url)
+            if resp is not None and resp.status_code == 200:
+                ctype = resp.headers.get("content-type", "")
+                if "html" in ctype:
+                    # Size cap on page HTML.
+                    raw = resp.content[:MAX_PAGE_BYTES].decode("utf-8", "replace")
+                    vc.fetched = True
+                    image_targets = extract_image_urls(raw, final_url or candidate.url)
+                    vc.fetch_note = f"HTTP 200, {len(image_targets)} image refs"
+                else:
+                    vc.fetch_note = f"HTTP 200 but content-type={ctype!r}"
+            elif resp is not None:
                 vc.fetch_note = f"HTTP {resp.status_code} (login wall or bot block)"
+            else:
+                vc.fetch_note = "fetch failed (SSRF block or network error)"
         except Exception as exc:  # noqa: BLE001
             vc.fetch_note = f"fetch failed: {type(exc).__name__}"
 
