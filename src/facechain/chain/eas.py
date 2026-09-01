@@ -21,17 +21,7 @@ from eth_account import Account
 from web3 import Web3
 from web3.logs import DISCARD
 
-from ..config import (
-    EAS_CONTRACT,
-    EAS_SCHEMA_DEFINITION,
-    EASSCAN_ATTESTATION,
-    EASSCAN_SCHEMA,
-    EXPLORER_TX,
-    FALLBACK_RPCS,
-    SCHEMA_REGISTRY_CONTRACT,
-    SEPOLIA_CHAIN_ID,
-    settings,
-)
+from ..config import EAS_SCHEMA_DEFINITION, settings
 from ..evidence.hashing import hex0x, sha256_text
 from ..models import AttestedPayload, ChainRecord
 from .abi import EAS_ABI, SCHEMA_REGISTRY_ABI
@@ -84,36 +74,66 @@ class InsufficientFunds(ChainError):
 
 class EasClient:
     def __init__(self, rpc_url: str | None = None, private_key: str | None = None) -> None:
-        self.rpc_url = rpc_url or settings.base_sepolia_rpc_url
-        self.w3 = self._connect(self.rpc_url)
-        self.eas = self.w3.eth.contract(
-            address=Web3.to_checksum_address(EAS_CONTRACT), abi=EAS_ABI
-        )
-        self.registry = self.w3.eth.contract(
-            address=Web3.to_checksum_address(SCHEMA_REGISTRY_CONTRACT), abi=SCHEMA_REGISTRY_ABI
-        )
+        self.chain_id = settings.chain_id
+        self.chain_name = settings.chain_name
+        self.eas_address = Web3.to_checksum_address(settings.eas_contract)
+        self.registry_address = Web3.to_checksum_address(settings.schema_registry_contract)
+
+        candidates = (rpc_url, *settings.rpc_candidates) if rpc_url else settings.rpc_candidates
+        self.rpc_url = candidates[0]
+        self.w3 = self._connect(candidates)
+        self.eas = self.w3.eth.contract(address=self.eas_address, abi=EAS_ABI)
+        self.registry = self.w3.eth.contract(address=self.registry_address, abi=SCHEMA_REGISTRY_ABI)
+        self._assert_contracts_deployed()
         key = (private_key or settings.private_key or "").strip()
         self.account = Account.from_key(key) if key else None
 
     # ---- connection ------------------------------------------------------
 
-    def _connect(self, primary: str) -> Web3:
-        """Try the configured RPC, then public fallbacks; assert the chain id."""
+    def _connect(self, candidates) -> Web3:
+        """Connect to the first RPC that actually serves the selected chain.
+
+        An RPC on the wrong network is rejected outright rather than used:
+        writing an attestation to an unintended chain is not recoverable.
+        """
         errors: list[str] = []
-        for url in [primary, *[u for u in FALLBACK_RPCS if u != primary]]:
+        candidates = [u for u in candidates if u]
+        for url in candidates:
             try:
                 w3 = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 30}))
-                chain_id = w3.eth.chain_id
-                if chain_id != SEPOLIA_CHAIN_ID:
-                    errors.append(f"{url}: wrong chain id {chain_id}")
+                actual = w3.eth.chain_id
+                if actual != self.chain_id:
+                    errors.append(
+                        f"{url}: serves chain {actual}, expected {self.chain_id} "
+                        f"({self.chain_name})"
+                    )
                     continue
-                if url != primary:
-                    log.warning("primary RPC unusable, using fallback %s", url)
+                if url != candidates[0]:
+                    log.warning("using fallback RPC %s", url)
                 self.rpc_url = url
                 return w3
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"{url}: {type(exc).__name__}: {str(exc)[:120]}")
-        raise ChainError("cannot reach Ethereum Sepolia. Tried:\n  " + "\n  ".join(errors))
+        raise ChainError(
+            f"cannot reach {self.chain_name} (chain id {self.chain_id}). Tried:\n  "
+            + "\n  ".join(errors)
+        )
+
+    def _assert_contracts_deployed(self) -> None:
+        """Refuse to run against addresses that hold no code.
+
+        EAS sits at a different address on every chain. A wrong address does
+        not revert — a call to an account with no code succeeds, burns gas and
+        records nothing — so this is checked before any transaction is built.
+        """
+        for label, addr in (("EAS", self.eas_address),
+                            ("SchemaRegistry", self.registry_address)):
+            if len(self.w3.eth.get_code(addr)) == 0:
+                raise ChainError(
+                    f"no contract code at {label} address {addr} on {self.chain_name}. "
+                    "That address is wrong for this network — check NETWORK in .env and "
+                    "the NETWORKS table in src/facechain/config.py."
+                )
 
     @property
     def address(self) -> str:
@@ -249,7 +269,9 @@ class EasClient:
         data = encode_data(fields)
         req = self._request(schema, data, recipient)
         record = ChainRecord(
-            eas_contract=EAS_CONTRACT,
+            network=self.chain_name,
+            chain_id=self.chain_id,
+            eas_contract=self.eas_address,
             schema_uid=schema,
             schema_definition=EAS_SCHEMA_DEFINITION,
             attester=self.address,
@@ -268,14 +290,14 @@ class EasClient:
         record.tx_hash = tx_hash
         record.block_number = int(receipt["blockNumber"])
         record.gas_used = int(receipt["gasUsed"])
-        record.explorer_tx = EXPLORER_TX.format(tx=tx_hash)
+        record.explorer_tx = settings.explorer_tx(tx_hash)
 
         if receipt["status"] != 1:
             raise ChainError(f"attestation transaction reverted: {record.explorer_tx}")
 
         record.attestation_uid = self._uid_from_receipt(receipt)
         if record.attestation_uid:
-            record.explorer_attestation = EASSCAN_ATTESTATION.format(uid=record.attestation_uid)
+            record.explorer_attestation = settings.easscan_attestation(record.attestation_uid)
         return record
 
     def _uid_from_receipt(self, receipt) -> str | None:
@@ -317,7 +339,7 @@ class EasClient:
             {
                 "from": sender,
                 "nonce": self.w3.eth.get_transaction_count(sender),
-                "chainId": SEPOLIA_CHAIN_ID,
+                "chainId": self.chain_id,
                 "gas": max(gas, 60_000),
                 "maxPriorityFeePerGas": tip,
                 "maxFeePerGas": int(base_fee * 2) + tip,
@@ -397,7 +419,7 @@ class EasClient:
         return (not mismatches), mismatches, onchain
 
     def schema_explorer_url(self, uid: str) -> str:
-        return EASSCAN_SCHEMA.format(uid=uid)
+        return settings.easscan_schema(uid)
 
 
 def wait_for_funding(client: EasClient, min_eth: float = 0.00002, timeout_s: int = 0) -> float:

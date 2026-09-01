@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Register (once) the FaceChain EAS schema on Base Sepolia.
+"""Register (once) the FaceChain EAS schema on the configured testnet.
 
 The schema UID is derived from the schema string itself, so this script is
 idempotent: if the schema already exists on chain — registered by you or by
@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from facechain.chain.eas import ChainError, EasClient  # noqa: E402
 from facechain.chain.schema import parse_schema, schema_uid  # noqa: E402
-from facechain.config import EAS_SCHEMA_DEFINITION, EASSCAN_SCHEMA  # noqa: E402
+from facechain.config import EAS_SCHEMA_DEFINITION, settings  # noqa: E402
 
 
 def main() -> int:
@@ -32,7 +32,8 @@ def main() -> int:
     for typ, name in parse_schema():
         print(f"  {typ:<10} {name}")
     print(f"\nDeterministic UID : {uid}")
-    print(f"Explorer          : {EASSCAN_SCHEMA.format(uid=uid)}")
+    print(f"Network           : {settings.chain_name} (chain id {settings.chain_id})")
+    print(f"Explorer          : {settings.easscan_schema(uid)}")
 
     try:
         client = EasClient()

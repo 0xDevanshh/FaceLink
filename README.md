@@ -2,9 +2,12 @@
 
 A CLI pipeline that takes a photo, detects and encodes the face in it, finds a
 **real** matching social-media post through **genuine reverse-image search**, and
-writes the verified match to **Base Sepolia** as a tamper-evident
+writes the verified match to **Ethereum Sepolia** as a tamper-evident
 [EAS](https://attest.org) attestation — then reads it back off the chain and
 checks it field by field.
+
+A live record produced by this pipeline:
+[`0x9d1d9466…aef40bb`](https://sepolia.easscan.org/attestation/view/0x9d1d946633f2cddaad062fc7826a959d851d5f0d853742e33a43b099aaef40bb)
 
 There are no hardcoded results anywhere. Every URL the pipeline reports came out
 of a live query to Google Lens, Yandex Images or Bing Visual Search during that
@@ -34,7 +37,7 @@ INPUT PHOTO
    │
    ├─ EVIDENCE BUNDLE ─→ canonical JSON ─→ evidenceHash (SHA-256)
    │
-   ├─ EAS ATTESTATION on Base Sepolia (chain id 84532)
+   ├─ EAS ATTESTATION on Ethereum Sepolia (chain id 11155111)
    │
    └─ READ BACK FROM CHAIN ─→ decode ─→ compare all 11 fields ─→ VERIFIED
 ```
@@ -68,7 +71,7 @@ INPUT PHOTO
 | Image hashing | SHA-256 + pHash/dHash/aHash (`imagehash`) | |
 | Reverse search | **Playwright** driving Google Lens, Yandex, Bing (+ TinEye) | optional SerpAPI fallback |
 | Candidate check | own HTTP fetch → `og:image` → download → pHash + ArcFace | never trusts the engine |
-| Blockchain | **Base Sepolia** + **EAS**, via `web3.py` | testnet, free |
+| Blockchain | **Ethereum Sepolia** + **EAS**, via `web3.py` | testnet, free |
 | Read-back | `getAttestation` → ABI-decode → field-by-field compare | |
 
 A run either produces a verified match or explains exactly which rung of the
@@ -107,11 +110,19 @@ Generate a **throwaway testnet** wallet and put its key in `.env`:
 python -c "from eth_account import Account; a=Account.create(); print(a.address, a.key.hex())"
 ```
 
-Fund the address with free Base Sepolia ETH (a full run costs well under
+Fund the address with free Sepolia ETH (a full run costs well under
 0.0001 ETH):
 
-- <https://portal.cdp.coinbase.com/products/faucet> — Base Sepolia, 0.1 ETH/day
-- <https://www.alchemy.com/faucets/base-sepolia>
+- <https://cloud.google.com/application/web3/faucet/ethereum/sepolia>
+- <https://www.alchemy.com/faucets/ethereum-sepolia>
+
+Check the chain configuration before spending anything — this verifies the RPC
+serves the expected chain and that the EAS addresses actually hold contract
+code:
+
+```bash
+python scripts/check_network.py
+```
 
 Register the EAS schema once (idempotent — it derives the UID and skips if the
 schema already exists):
@@ -119,6 +130,9 @@ schema already exists):
 ```bash
 python scripts/register_schema.py
 ```
+
+To attest on a different testnet instead, set `NETWORK=base-sepolia` in `.env`;
+everything else (chain id, EAS addresses, explorers, RPCs) follows from it.
 
 ### 3. Get a test photo
 
@@ -165,7 +179,7 @@ Sample output:
 ```
 ╭──────────────────────────────────────────────────╮
 │          FACECHAIN VERIFICATION PIPELINE         │
-│   v1.0.0 • Base Sepolia testnet • EAS attestations│
+│  v1.0.0 • Ethereum Sepolia • EAS attestations     │
 ╰──────────────────────────────────────────────────╯
 
 [01/07] Loading & hashing image…
@@ -182,9 +196,9 @@ Sample output:
 [05/07] Evidence bundle + hashes…
         ✓ evidenceHash sha256:236e1f9382d28d1a200c6c1f…
 [06/07] Blockchain attestation…
-        ├─ wallet                 ✓ 0xB48a…92f2 — 0.050000 ETH on Base Sepolia
+        ├─ wallet                 ✓ 0xF3F3…E45A — 0.067074 ETH on Ethereum Sepolia
         ├─ schema                 ✓ 0xa9ff57af6e5bea0d…
-        ├─ tx                     ✓ 0x… in block 46216481
+        ├─ tx                     ✓ 0x87ebdda7… in block 11614144
 [07/07] On-chain read-back verify…
         ✓ all 11 on-chain fields match local evidence
 ```

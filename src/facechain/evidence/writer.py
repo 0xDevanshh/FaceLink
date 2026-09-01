@@ -190,7 +190,7 @@ class EvidenceWriter:
             "1. shasum -a 256 -c input.sha256            # input image unchanged",
             "2. python scripts/verify_attestation.py --case <this directory>",
             "   (re-hashes attested_payload.json, reads the attestation from",
-            "    Base Sepolia, and compares every field)",
+            "    the chain it was written to, and compares every field)",
             "3. Or open the EAS explorer link above and compare the hashes by eye.",
             "",
             "SCOPE: this record attests that the supplied image and its primary",
