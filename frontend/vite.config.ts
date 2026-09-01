@@ -13,10 +13,16 @@ export default defineConfig({
       },
     },
   },
+  build: {
+    target: 'esnext',
+    esbuild: {
+      exclude: [],
+    },
+  },
   test: {
     globals: true,
     environment: 'jsdom',
     setupFiles: ['./src/test-setup.ts'],
     css: false,
   },
-})
+} as any)
