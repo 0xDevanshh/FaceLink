@@ -10,15 +10,15 @@ export default defineConfig({
         target: 'http://localhost:8000',
         changeOrigin: true,
         secure: false,
-        // Critical for SSE: disable response buffering
-        configure: (proxy) => {
-          proxy.on('proxyRes', (proxyRes) => {
-            // Tell Nginx/any intermediary not to buffer
-            proxyRes.headers['x-accel-buffering'] = 'no'
-            proxyRes.headers['cache-control'] = 'no-cache'
-          })
-        },
+        ws: true,
+        proxyTimeout: 600000,
       },
+    },
+  },
+  build: {
+    target: 'esnext',
+    esbuild: {
+      exclude: [],
     },
   },
   test: {
@@ -27,4 +27,4 @@ export default defineConfig({
     setupFiles: ['./src/test-setup.ts'],
     css: false,
   },
-})
+} as any)

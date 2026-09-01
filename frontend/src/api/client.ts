@@ -1,6 +1,8 @@
 // Typed API client — all network calls go through here.
 // Secrets never leave the backend; this client only handles public data.
 
+/// <reference types="vite/client" />
+
 import type {
   CaseResult,
   HealthResponse,
