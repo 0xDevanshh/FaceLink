@@ -94,11 +94,13 @@ class VerifiedCandidate(BaseModel):
     face_detected: bool = False
     face_similarity: float = 0.0
     metadata_consistency: float = 0.0
+    confidence_band: str = "INSUFFICIENT"  # STRONG | MODERATE | WEAK | INSUFFICIENT
 
     stages: list[Stage] = Field(default_factory=list)
     match_type: str = "none"  # exact-image | face-only | none
     final_score: float = 0.0
     verified: bool = False
+    rejection_reason: str = ""  # populated when not verified
 
     def rounded(self) -> "VerifiedCandidate":
         c = self.model_copy()

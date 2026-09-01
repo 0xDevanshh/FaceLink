@@ -12,12 +12,12 @@ retrieved public image under the thresholds recorded in the evidence bundle.
 
 from __future__ import annotations
 
-from ..config import settings
+from ..config import confidence_band, settings
 from ..models import LADDER, Stage, VerifiedCandidate
 
 
 def score_candidate(vc: VerifiedCandidate) -> VerifiedCandidate:
-    """Populate `stages`, `match_type`, `final_score` and `verified`.
+    """Populate `stages`, `match_type`, `final_score`, `verified`, and `confidence_band`.
 
     What VERIFIED requires, and why:
 
@@ -56,6 +56,7 @@ def score_candidate(vc: VerifiedCandidate) -> VerifiedCandidate:
         + settings.weight_image * vc.image_similarity
         + settings.weight_meta * vc.metadata_consistency
     )
+    vc.confidence_band = confidence_band(vc.face_similarity)
 
     required = {Stage.SEARCH_FOUND, Stage.SOCIAL_MATCH, Stage.FACE_MATCH}
     if required.issubset(set(stages)) and vc.final_score >= settings.verify_min_score:
@@ -63,7 +64,31 @@ def score_candidate(vc: VerifiedCandidate) -> VerifiedCandidate:
         vc.verified = True
 
     vc.stages = [s for s in LADDER if s in set(stages)]
+
+    if not vc.verified:
+        vc.rejection_reason = _rejection_reason(vc, stages)
+
     return vc
+
+
+def _rejection_reason(vc: VerifiedCandidate, stages: list[Stage]) -> str:
+    """Precise reason why this specific candidate was not verified."""
+    if Stage.SOCIAL_MATCH not in stages:
+        return f"not on a supported social platform (domain: {vc.domain})"
+    if not vc.candidate_image_sha256:
+        return "no comparable image could be retrieved (login wall or bot block)"
+    if not vc.face_detected:
+        return "no face detectable in the retrieved image"
+    if not vc.face_detected or vc.face_similarity < settings.face_match_threshold:
+        return (
+            f"face similarity {vc.face_similarity:.3f} below threshold "
+            f"{settings.face_match_threshold}"
+        )
+    return (
+        f"composite score {vc.final_score:.3f} below minimum "
+        f"{settings.verify_min_score} (face {vc.face_similarity:.3f}, "
+        f"image {vc.image_similarity:.3f})"
+    )
 
 
 def rank(candidates: list[VerifiedCandidate]) -> list[VerifiedCandidate]:
