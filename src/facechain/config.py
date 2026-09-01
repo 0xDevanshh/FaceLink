@@ -8,6 +8,21 @@ from typing import Literal
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# Confidence bands for face similarity scores (plain-language labels).
+CONFIDENCE_BANDS = [
+    (0.85, "STRONG"),
+    (0.70, "MODERATE"),
+    (0.50, "WEAK"),
+    (0.0, "INSUFFICIENT"),
+]
+
+
+def confidence_band(score: float) -> str:
+    for threshold, label in CONFIDENCE_BANDS:
+        if score >= threshold:
+            return label
+    return "INSUFFICIENT"
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # ---------------------------------------------------------------------------
@@ -155,6 +170,31 @@ class Settings(BaseSettings):
         "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
     )
 
+    # ---- quality gating --------------------------------------------------
+    # Minimum face dimension in pixels (shorter side of bounding box).
+    min_face_px: int = 80
+    # Laplacian variance below this → BLURRY rejection.
+    quality_blur_threshold: float = 40.0
+    # Mean luminance bounds.
+    quality_min_brightness: float = 15.0
+    quality_max_brightness: float = 240.0
+    # Maximum input image edge (pixels) before hard rejection (IMAGE_TOO_LARGE).
+    max_image_edge: int = 8000
+    # What to do when multiple faces are detected: reject | largest | all
+    multi_face_policy: Literal["reject", "largest", "all"] = "largest"
+
+    # ---- API keys for Tier-1 / Tier-2 search ----------------------------
+    facecheck_api_key: str = ""
+    search4faces_api_key: str = ""
+
+    # ---- web server (FastAPI) -------------------------------------------
+    api_host: str = "0.0.0.0"
+    api_port: int = 8000
+    api_cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
+    api_upload_max_mb: int = 10
+    api_max_concurrent_scans: int = 4
+    api_job_ttl_s: int = 3600  # 1 hour
+
     # ---- output ----------------------------------------------------------
     evidence_dir: Path = Field(default=REPO_ROOT / "evidence")
 
@@ -211,6 +251,9 @@ class Settings(BaseSettings):
 
     def easscan_schema(self, uid: str) -> str:
         return self.chain["easscan_schema"].format(uid=uid)
+    @property
+    def cors_origins_list(self) -> list[str]:
+        return [o.strip() for o in self.api_cors_origins.split(",") if o.strip()]
 
 
 settings = Settings()
