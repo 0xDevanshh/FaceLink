@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Independently verify a FaceChain record against Base Sepolia.
+"""Independently verify a FaceChain record against the chain it was written to.
 
 This script deliberately shares as little as possible with the pipeline that
 produced the record: it re-reads the evidence bundle from disk, re-computes
@@ -9,7 +9,7 @@ It never trusts `blockchain.json`'s own claims about what was verified.
     # full check of a bundle (hashes + on-chain fields + bundle integrity)
     python scripts/verify_attestation.py --case evidence/case_20260901_004512
 
-    # just dump any attestation on Base Sepolia
+    # just dump any attestation on the configured network
     python scripts/verify_attestation.py --uid 0xabc…
 """
 
@@ -23,6 +23,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from facechain.chain.eas import ChainError, EasClient  # noqa: E402
+from facechain.config import settings  # noqa: E402
 from facechain.evidence.hashing import sha256_canonical, sha256_file, sha256_text  # noqa: E402
 from facechain.evidence.writer import verify_bundle_integrity  # noqa: E402
 from facechain.models import AttestedPayload  # noqa: E402
@@ -122,7 +123,7 @@ def verify_case(case_dir: Path) -> int:
     )
 
     print(f"\n  block timestamp of attestation: {onchain['time']}")
-    print(f"  explorer: https://base-sepolia.easscan.org/attestation/view/{uid}")
+    print(f"  explorer: {settings.easscan_attestation(uid)}")
 
     passed = all(results)
     print(f"\n{'=' * 62}\nRESULT: {'VERIFIED — local evidence and chain agree' if passed else 'MISMATCH — see FAIL lines above'}")
@@ -145,7 +146,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     group = ap.add_mutually_exclusive_group(required=True)
     group.add_argument("--case", type=Path, help="path to an evidence/case_* directory")
-    group.add_argument("--uid", help="attestation UID to read from Base Sepolia")
+    group.add_argument("--uid", help="attestation UID to read from the configured network")
     args = ap.parse_args()
     return verify_case(args.case) if args.case else dump_uid(args.uid)
 

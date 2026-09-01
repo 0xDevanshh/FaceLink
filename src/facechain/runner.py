@@ -181,7 +181,8 @@ def run(opts: RunOptions, report: Reporter | None = None) -> Case:
 
     # ---- 6. blockchain attestation --------------------------------------
     if opts.chain_mode == "skip":
-        case.blockchain = ChainRecord(mode="skipped", note="--no-chain requested")
+        case.blockchain = ChainRecord(network=settings.chain_name, chain_id=settings.chain_id,
+                                      mode="skipped", note="--no-chain requested")
         case.verdict = "VERIFIED_OFFCHAIN"
         emit("chain", "info", "skipped by request")
         writer.write_bundle(case, path)
@@ -198,6 +199,8 @@ def run(opts: RunOptions, report: Reporter | None = None) -> Case:
             schema = settings.eas_schema_uid or predict_schema_uid()
             uid = client.simulate_attest(schema, fields)
             case.blockchain = ChainRecord(
+                network=client.chain_name,
+                chain_id=client.chain_id,
                 mode="simulate",
                 eas_contract=client.eas.address,
                 schema_uid=schema,
@@ -212,7 +215,7 @@ def run(opts: RunOptions, report: Reporter | None = None) -> Case:
             return case
 
         balance = client.preflight()
-        emit("chain:wallet", "ok", f"{client.address} — {balance:.6f} ETH on Base Sepolia")
+        emit("chain:wallet", "ok", f"{client.address} — {balance:.6f} ETH on {client.chain_name}")
 
         schema = client.resolve_schema()
         emit("chain:schema", "ok", schema)
@@ -244,7 +247,8 @@ def run(opts: RunOptions, report: Reporter | None = None) -> Case:
         # a chain-side failure must degrade the verdict, not lose the evidence.
         if not isinstance(exc, (InsufficientFunds, ChainError)):
             log.exception("unexpected error in blockchain stage")
-        case.blockchain = ChainRecord(mode="failed", note=str(exc)[:500])
+        case.blockchain = ChainRecord(network=settings.chain_name, chain_id=settings.chain_id,
+                                      mode="failed", note=str(exc)[:500])
         case.verdict = "VERIFIED_OFFCHAIN"
         case.failure_reason = f"blockchain stage failed: {str(exc)[:300]}"
         emit("chain", "fail", str(exc)[:300])

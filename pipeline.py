@@ -76,7 +76,7 @@ def header() -> None:
         Panel(
             Text.from_markup(
                 "[bold white]FACECHAIN VERIFICATION PIPELINE[/bold white]\n"
-                f"[dim]v{PIPELINE_VERSION} • Ethereum Sepolia testnet • EAS attestations[/dim]",
+                f"[dim]v{PIPELINE_VERSION} • {settings.chain_name} testnet • EAS attestations[/dim]",
                 justify="center",
             ),
             border_style="cyan",
@@ -141,7 +141,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="pipeline.py",
         description="Detect a face, find a real matching social post via reverse image "
-                    "search, and attest the match on Base Sepolia via EAS.",
+                    "search, and attest the match on an EVM testnet via EAS.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--image", required=True, help="path to the input photo")

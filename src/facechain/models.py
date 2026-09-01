@@ -110,8 +110,10 @@ class VerifiedCandidate(BaseModel):
 
 
 class ChainRecord(BaseModel):
-    network: str = "Ethereum Sepolia"
-    chain_id: int = 11155111
+    # Always set from the live client, never assumed: a record must not
+    # claim a chain it was not written to.
+    network: str = ""
+    chain_id: int = 0
     eas_contract: str = ""
     schema_uid: str = ""
     schema_definition: str = ""
