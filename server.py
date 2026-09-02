@@ -9,6 +9,18 @@ stage logic and evidence generation. The server never subprocesses pipeline.py.
 
 from __future__ import annotations
 
+# ── WINDOWS EVENT LOOP POLICY ──────────────────────────────────────────────
+# MUST be set before ANY other asyncio usage in this process.
+# Playwright's sync API calls asyncio.create_subprocess_exec to spawn Chromium.
+# On Windows, ProactorEventLoop supports subprocess from any thread.
+# We set the policy here — at the very top of the server module — so it is
+# guaranteed before uvicorn, FastAPI, or any worker thread touches asyncio.
+import sys as _sys
+if _sys.platform == "win32":
+    import asyncio as _asyncio
+    _asyncio.set_event_loop_policy(_asyncio.WindowsProactorEventLoopPolicy())
+# ───────────────────────────────────────────────────────────────────────────
+
 import asyncio
 import io
 import json

@@ -100,12 +100,13 @@ def _run_browser_engine(name: str, image_path: str, public_url: str | None) -> E
     A per-provider browser is what makes provider isolation and provider
     concurrency possible at once: the sync Playwright API may only be used from
     the thread that created it.
+
+    The Windows ProactorEventLoop policy is set at server.py startup so
+    subprocess spawning works from any thread in the process.
     """
     with BrowserSession() as session:
         adapter = BROWSER_ADAPTERS[name](session)
         res = adapter.search(image_path, public_url)
-        # An engine's by-URL path can fail while its upload path works. Only
-        # worth retrying when the failure was not a refusal to serve us at all.
         if not res.ok and public_url and _status_for(res) not in (
             ProviderStatus.CHALLENGED, ProviderStatus.RATE_LIMITED
         ):
