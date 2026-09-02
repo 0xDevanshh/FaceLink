@@ -19,13 +19,14 @@ from . import PIPELINE_VERSION
 from .chain.eas import ChainError, EasClient, InsufficientFunds
 from .chain.schema import schema_uid as predict_schema_uid
 from .config import EAS_SCHEMA_DEFINITION, settings
-from .evidence.hashing import sha256_file
+from .evidence.hashing import sha256_bytes, sha256_file
 from .evidence.writer import EvidenceWriter, new_case_id
-from .face.encoder import crop_face, encode_face, read_image
-from .face.detector import select_primary
-from .models import Case, ChainRecord, InputImage, VerifiedCandidate
+from .face import selection as face_selection
+from .face.encoder import crop_face, encode_detected, read_image
+from .face.detector import load_backend
+from .models import Case, ChainRecord, FaceRecord, FaceSelection, InputImage, VerifiedCandidate
 from .search.orchestrator import run_reverse_search
-from .verification.candidate import verify_candidate
+from .verification.candidate import MediaCache, verify_candidate
 from .verification.image_similarity import perceptual_hashes
 from .verification.scorer import explain_failure, highest_stage_reached, rank, score_candidate
 
@@ -44,10 +45,81 @@ class RunOptions:
     face_backend: str | None = None
     max_verify: int | None = None
     case_id: str | None = None
+    # ---- face selection -------------------------------------------------
+    face_index: int | None = None
+    crop_rect: list[int] | None = None
+    selection_mode: str | None = None
+    # ---- scan depth -----------------------------------------------------
+    # fast: small candidate set (10), standard: normal (12), deep: maximum (30+)
+    scan_depth: str = "standard"  # fast | standard | deep
 
 
 class PipelineError(RuntimeError):
     pass
+
+
+from .verification.clustering import cluster_candidates, corroboration_summary
+
+# ---- scan depth budgets -----------------------------------------------
+DEPTH_BUDGETS: dict[str, int] = {
+    "fast": 5,
+    "standard": 12,
+    "deep": 30,
+}
+# Maximum bytes to download across all candidate images in one scan.
+MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
+
+# Share of the verification budget reserved for candidates outside the priority
+# platforms. Without a reservation, a run that happens to surface 12 LinkedIn
+# pages would never look at the wider web at all — which is how search priority
+# quietly turns into search exclusivity.
+WIDER_WEB_BUDGET_SHARE = 0.25
+
+# At most this many candidates from any single domain. A real run spent four of
+# twelve slots on four near-identical pages from one site, which crowds out
+# genuinely different sources without adding any independent evidence.
+MAX_PER_DOMAIN = 2
+
+
+def _spread_domains(candidates: list, cap: int = MAX_PER_DOMAIN) -> list:
+    """Order-preserving pass that limits how many hits one domain contributes.
+
+    Overflow is not discarded but appended after everything else, so a domain
+    with many hits still gets looked at if budget remains.
+    """
+    kept: list = []
+    overflow: list = []
+    seen: dict[str, int] = {}
+    for cand in candidates:
+        seen[cand.domain] = seen.get(cand.domain, 0) + 1
+        (kept if seen[cand.domain] <= cap else overflow).append(cand)
+    return kept + overflow
+
+
+def _verification_queue(candidates: list, limit: int) -> list:
+    """Choose which candidates get the (finite) fetch-and-measure budget.
+
+    Priority platforms are drained first, but a slice of the budget is held back
+    for everything else, so a strong match on a personal site or a conference
+    page is still reachable in a run dominated by social hits.
+    """
+    if limit <= 0:
+        return []
+    from .config import OTHER_WEB_PRIORITY
+
+    candidates = _spread_domains(candidates)
+    priority = [c for c in candidates if c.platform_priority < OTHER_WEB_PRIORITY]
+    wider = [c for c in candidates if c.platform_priority >= OTHER_WEB_PRIORITY]
+
+    reserved = min(len(wider), max(1, int(limit * WIDER_WEB_BUDGET_SHARE))) if wider else 0
+    queue = priority[: limit - reserved]
+    queue += wider[: limit - len(queue)]
+    # Any budget the priority tier did not use goes back to the wider web, and
+    # vice versa, so the reservation never wastes capacity.
+    if len(queue) < limit:
+        seen = {id(c) for c in queue}
+        queue += [c for c in candidates if id(c) not in seen][: limit - len(queue)]
+    return queue
 
 
 def run(opts: RunOptions, report: Reporter | None = None) -> Case:
@@ -81,44 +153,199 @@ def run(opts: RunOptions, report: Reporter | None = None) -> Case:
     )
     emit("input", "ok", f"{case.input.width}x{case.input.height}, sha256 {case.input.sha256[:16]}…")
 
-    # ---- 2. face detection + embedding ----------------------------------
+    # ---- 2. face detection, selection, quality gate, embedding ----------
+    #
+    # Order matters here. Detection runs once on the original image; an
+    # operator-supplied crop is applied and re-detected inside it, so the face
+    # that gets embedded is always a face that was detected in the pixels the
+    # gate measured. The original image and its hash are never replaced.
     emit("face", "start", "")
-    face_record, embedding, all_faces = encode_face(img, opts.face_backend)
-    case.face = face_record
-    if not face_record.detected or embedding is None:
+    original_sha256 = case.input.sha256
+    working = img
+    crop_applied: tuple[int, int, int, int] | None = None
+    crop_sha256: str | None = None
+    crop_path: Path | None = None
+    mode = "auto"
+
+    if opts.crop_rect:
+        try:
+            working, crop_applied = face_selection.apply_crop(img, opts.crop_rect)
+        except face_selection.CropError as exc:
+            case.verdict = "INVALID_CROP"
+            case.failure_reason = f"crop rejected: {exc}"
+            emit("face", "fail", case.failure_reason)
+            writer.write_bundle(case, path)
+            return case
+        crop_bytes = face_selection.encode_png(working)
+        crop_sha256 = sha256_bytes(crop_bytes)
+        crop_path = writer.save_bytes("selected_crop.png", crop_bytes)
+        mode = "manual-crop"
+        emit("face:crop", "ok",
+             f"{crop_applied[2]}x{crop_applied[3]} at {crop_applied[0]},{crop_applied[1]}")
+
+    backend = load_backend(opts.face_backend)
+    all_faces = backend.detect(working)
+    offer = face_selection.offer(working, all_faces)
+
+    if not all_faces:
+        case.face = FaceRecord(detected=False, backend=backend.name,
+                               model=backend.model_name, faces_found=0)
         case.verdict = "NO_FACE"
-        case.failure_reason = "no face detected in the input image"
+        case.failure_reason = (
+            "No usable face detected. Please upload a clearer image or manually "
+            "select a face."
+        )
         emit("face", "fail", case.failure_reason)
         writer.write_bundle(case, path)
         return case
 
-    primary = select_primary(all_faces)
+    # Resolve which face this scan is about.
+    face_index = opts.face_index
+    if face_index is not None:
+        if not 0 <= face_index < len(all_faces):
+            case.verdict = "INVALID_FACE_SELECTION"
+            case.failure_reason = (
+                f"face_index {face_index} does not exist; {len(all_faces)} face(s) detected"
+            )
+            emit("face", "fail", case.failure_reason)
+            writer.write_bundle(case, path)
+            return case
+        # Only *infer* a manual selection. When the caller told us how the face
+        # was chosen we believe it — the UI passes `auto` along with the index
+        # it was itself given, and recording that as "manual-face" would put a
+        # claim in the evidence that a human made a choice they never made.
+        if mode == "auto" and opts.selection_mode is None:
+            mode = "manual-face"
+    elif offer.auto_index is not None:
+        face_index = offer.auto_index
+    elif crop_applied is not None:
+        # An operator drew a crop around the face they meant; the largest face
+        # inside that crop is that face, so no further prompt is warranted.
+        face_index = max(range(len(all_faces)), key=lambda i: all_faces[i].area)
+    else:
+        # Ambiguous, and nobody has chosen. Refusing beats guessing: a wrong
+        # automatic pick yields a confident scan of the wrong person.
+        case.face = FaceRecord(
+            detected=True, backend=backend.name, model=backend.model_name,
+            faces_found=len(all_faces),
+            faces=offer.faces,
+        )
+        case.face_selection = FaceSelection(
+            mode="pending", faces_offered=len(offer.faces),
+            original_sha256=original_sha256,
+            original_width=case.input.width, original_height=case.input.height,
+            selected_at=datetime.now(timezone.utc).isoformat(),
+        )
+        case.verdict = "FACE_SELECTION_REQUIRED"
+        case.failure_reason = offer.reason
+        emit("face:selection_required", "fail", offer.reason)
+        writer.write_bundle(case, path)
+        return case
+
+    # A caller-supplied mode wins over the inferred one, except that an applied
+    # crop is a fact about the pixels and cannot be relabelled away.
+    if mode != "manual-crop" and opts.selection_mode in ("auto", "manual-face", "manual-crop"):
+        mode = opts.selection_mode
+
+    # Quality gate on the face we are actually about to embed.
+    quality = face_selection.gate_selected(working, all_faces, face_index)
+    if not quality.passed:
+        case.face = FaceRecord(
+            detected=True, backend=backend.name, model=backend.model_name,
+            faces_found=len(all_faces), faces=offer.faces, quality=quality.rounded(),
+        )
+        case.verdict = "FACE_QUALITY_INSUFFICIENT"
+        case.failure_reason = (
+            "Face quality is insufficient for reliable matching. Please select a "
+            f"clearer or larger face. ({quality.error}: {quality.detail})"
+        )
+        emit("face:quality", "fail", f"{quality.error}: {quality.detail}")
+        writer.write_bundle(case, path)
+        return case
+    emit("face:quality", "ok",
+         f"blur {quality.blur_score:.1f}, face {quality.face_px}px, {quality.face_count} face(s)")
+
+    face_record, embedding, primary = encode_detected(backend, all_faces, face_index)
+    face_record.faces = offer.faces
+    face_record.quality = quality.rounded()
+    case.face = face_record
+    if not face_record.detected or embedding is None:
+        case.verdict = "NO_FACE"
+        case.failure_reason = "no face could be embedded from the selected region"
+        emit("face", "fail", case.failure_reason)
+        writer.write_bundle(case, path)
+        return case
+
     if primary is not None:
-        ok, buf = cv2.imencode(".png", crop_face(img, primary))
+        ok, buf = cv2.imencode(".png", crop_face(working, primary))
         if ok:
             writer.save_bytes("face_crop.png", buf.tobytes())
+
+    case.face_selection = FaceSelection(
+        mode=mode,
+        face_index=face_index,
+        faces_offered=len(offer.faces),
+        bbox=face_record.bbox,
+        crop_rect=list(crop_applied) if crop_applied else None,
+        crop_sha256=crop_sha256,
+        original_sha256=original_sha256,
+        original_width=case.input.width,
+        original_height=case.input.height,
+        selected_at=datetime.now(timezone.utc).isoformat(),
+    )
     emit(
         "face",
         "ok",
-        f"{face_record.faces_found} face(s), {face_record.embedding_dimension}-D "
-        f"{face_record.model}, det {face_record.det_score:.3f}",
+        f"{face_record.faces_found} face(s), selected #{face_index} ({mode}), "
+        f"{face_record.embedding_dimension}-D {face_record.model}, "
+        f"det {face_record.det_score:.3f}",
     )
 
     # ---- 3. reverse image search ----------------------------------------
+    #
+    # The *query* is the region the operator selected, not always the whole
+    # upload. When someone crops one person out of a group shot, searching the
+    # full frame searches for the group shot: a real run cropped one face out of
+    # a two-person photo and every engine hit came back matching the composite,
+    # leaving the best face similarity at 0.079 while the uncropped run on the
+    # same person scored 0.96. The crop is what they asked to look for.
+    #
+    # A bare face *selection* (no crop) still searches the whole image on
+    # purpose: the other people in it are legitimately part of the photograph,
+    # the full frame can find the original as an exact-image match, and face
+    # verification against the selected face is what decides whether a hit is
+    # about the right person.
+    #
+    # The original is untouched throughout — its bytes, hash and phash are the
+    # evidence anchor regardless of what was searched.
+    search_path = crop_path if crop_path is not None else path
+    query_hashes = perceptual_hashes(working) if crop_path is not None else input_hashes
+    if crop_path is not None:
+        emit("search:query", "info", "searching the selected crop, not the full upload")
+
     emit("search", "start", "")
     search_report, public_url = run_reverse_search(
-        str(path),
+        str(search_path),
         engines=opts.engines,
         image_url=opts.image_url,
         on_event=lambda eng, status, detail: emit(f"search:{eng}", status, detail),
     )
     case.reverse_search = search_report
+    # Report every provider's terminal state, including the ones that found
+    # nothing — "we asked Bing and it challenged us" is part of the record.
+    for provider in search_report.providers:
+        emit(f"search:{provider.engine}", "info",
+             f"{provider.status.value} · {provider.candidates} candidates "
+             f"· {provider.duration_s:.1f}s")
+    for platform, count in search_report.platform_counts.items():
+        emit("search:platform", "info", f"{platform}: {count}")
+
     if not search_report.candidates:
+        statuses = ", ".join(
+            f"{p.engine}={p.status.value}" for p in search_report.providers
+        ) or "no provider ran"
         case.verdict = "NO_SEARCH_RESULTS"
-        case.failure_reason = (
-            "no reverse-image engine returned usable results: "
-            + "; ".join(f"{k}={v}" for k, v in search_report.engine_errors.items())
-        )
+        case.failure_reason = f"no reverse-image provider returned usable results ({statuses})"
         emit("search", "fail", case.failure_reason)
         writer.write_bundle(case, path)
         return case
@@ -126,31 +353,65 @@ def run(opts: RunOptions, report: Reporter | None = None) -> Case:
         "search",
         "ok",
         f"{search_report.total_candidates} candidates "
-        f"({search_report.social_candidates} social) from "
+        f"({search_report.social_candidates} on named platforms) from "
         f"{', '.join(search_report.engines_succeeded) or 'no engine'}",
     )
 
     # ---- 4. candidate verification --------------------------------------
     emit("verify", "start", "")
-    limit = opts.max_verify or settings.max_candidates_to_verify
-    # Social candidates first — the task asks specifically for a social post.
-    queue = [c for c in search_report.candidates if c.is_social][:limit]
-    remaining = limit - len(queue)
-    if remaining > 0:
-        queue += [c for c in search_report.candidates if not c.is_social][:remaining]
+    depth_limit = DEPTH_BUDGETS.get(opts.scan_depth, DEPTH_BUDGETS["standard"])
+    limit = opts.max_verify or depth_limit
+    if opts.scan_depth == "deep":
+        emit("verify:depth", "info", f"deep scan mode — budget {limit} candidates")
+    queue = _verification_queue(search_report.candidates, limit)
 
     verified: list[VerifiedCandidate] = []
+    media_cache = MediaCache()
+    download_bytes = 0
     for cand in queue:
-        vc = score_candidate(verify_candidate(cand, input_hashes, embedding))
+        if download_bytes >= MAX_DOWNLOAD_BYTES:
+            emit("verify:limit", "info",
+                 f"download budget reached ({download_bytes // (1024*1024)}MB) — stopping early")
+            break
+        try:
+            vc = score_candidate(verify_candidate(cand, query_hashes, embedding, media_cache))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("candidate %s raised during verification: %s", cand.url, exc)
+            vc = VerifiedCandidate(
+                engine=cand.engine, url=cand.url, domain=cand.domain,
+                platform=cand.platform, is_social=cand.is_social,
+                canonical_url=cand.url, platform_priority=cand.platform_priority,
+                candidate_type=cand.candidate_type,
+                rejection_reason=f"verification error: {type(exc).__name__}",
+            )
         verified.append(vc)
+        download_bytes = media_cache.downloads * 500_000  # rough estimate for budget guard
         emit(
             "verify:candidate",
             "ok" if vc.verified else "info",
-            f"{vc.domain[:24]:<24} img {vc.image_similarity:.2f} face {vc.face_similarity:.2f} "
-            f"score {vc.final_score:.2f} {'VERIFIED' if vc.verified else vc.match_type}",
+            f"{(vc.platform or vc.domain)[:24]:<24} img {vc.image_similarity:.2f} "
+            f"face {vc.face_similarity:.2f} score {vc.final_score:.2f} "
+            f"{'VERIFIED' if vc.verified else vc.match_type}",
         )
-        if vc.verified:
-            break  # one confirmed social match is what the task requires
+        # Deep mode: early-stop only when we have 3+ independent verified clusters
+        if opts.scan_depth != "deep" and vc.verified:
+            # Standard/fast: stop at first verified match to save time
+            pass  # still process remainder so full ranked list is available
+    emit("verify:media", "info",
+         f"{media_cache.downloads} image download(s), {media_cache.hits} reused from cache")
+
+    # ---- 4b. image deduplication + corroboration -------------------------
+    clusters = cluster_candidates(verified)
+    corr = corroboration_summary(clusters)
+    emit(
+        "verify:corroboration", "info",
+        f"{corr.image_clusters} image clusters (deduped from {corr.total_candidates}), "
+        f"{corr.independent_domains} domains, {corr.independent_platforms} platforms, "
+        f"{corr.verified_clusters} verified",
+    )
+    if corr.duplicate_count > 0:
+        emit("verify:duplicates", "info",
+             f"{corr.duplicate_count} near-duplicate image(s) grouped — count as 1 evidence cluster each")
 
     ranked = rank(verified)
     case.verification = ranked

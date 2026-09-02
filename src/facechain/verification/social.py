@@ -30,8 +30,13 @@ def metadata_consistency(candidate: SearchCandidate, verified: VerifiedCandidate
     if verified.fetched:
         score += 0.2
 
-    # The compared image came from the page, not the engine's thumbnail cache.
-    if verified.candidate_image_source in ("og:image", "twitter:image", "json-ld", "link:image_src"):
+    # The compared image came from the page (or is the page), not the engine's
+    # thumbnail cache. `github:avatar` and `direct-image` rank with the metadata
+    # sources because both are the platform's own canonical asset.
+    if verified.candidate_image_source in (
+        "og:image", "twitter:image", "json-ld", "link:image_src",
+        "github:avatar", "direct-image",
+    ):
         score += 0.15
     elif verified.candidate_image_source == "img":
         score += 0.1

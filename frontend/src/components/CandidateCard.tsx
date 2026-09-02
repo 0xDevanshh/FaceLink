@@ -19,6 +19,29 @@ const PLATFORM_ICONS: Record<string, string> = {
   VK: '💬',
   Weibo: '🌐',
   Flickr: '📷',
+  GitHub: '🐙',
+}
+
+/**
+ * How the match was established. EXACT_IMAGE and SAME_FACE are claims about
+ * measurements — the same picture versus a different picture of the same face —
+ * and the distinction matters: a reposted photo and an independent photograph
+ * are different kinds of evidence.
+ */
+const TYPE_LABEL: Record<string, string> = {
+  EXACT_IMAGE: 'Exact image — the same picture',
+  SAME_FACE: 'Same face — a different picture',
+  SOCIAL_PROFILE: 'Social profile page',
+  SOCIAL_POST: 'Social post',
+  DEVELOPER_PROFILE: 'Developer profile',
+  PUBLIC_ARTICLE: 'Public article',
+  PUBLIC_WEB_PAGE: 'Public web page',
+  OTHER: 'Other',
+}
+
+const TYPE_STYLE: Record<string, string> = {
+  EXACT_IMAGE: 'text-accent border-accent/50',
+  SAME_FACE: 'text-success border-success/50',
 }
 
 const BAND_STYLE: Record<string, string> = {
@@ -69,12 +92,19 @@ export default function CandidateCard({ candidate: c, rank }: Props) {
             >
               {c.domain}
             </a>
-            {c.platform && (
-              <span className="text-xs text-muted">{c.platform}</span>
-            )}
+            <span className="text-xs text-muted">
+              {c.platform ?? 'Other Web'}
+            </span>
           </div>
         </div>
         <div className="flex items-center gap-2 shrink-0">
+          <span
+            className={`px-2 py-0.5 rounded border text-xs font-mono ${TYPE_STYLE[c.candidate_type] ?? 'text-muted border-border'}`}
+            title={TYPE_LABEL[c.candidate_type] ?? c.candidate_type}
+            data-testid="candidate-type"
+          >
+            {c.candidate_type}
+          </span>
           {isVerified ? (
             <span className="px-2 py-0.5 rounded-full text-xs font-bold bg-success/20 text-success border border-success/50">
               VERIFIED

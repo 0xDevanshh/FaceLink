@@ -1,13 +1,20 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react'
-import UploadView from './components/UploadView'
+import React, { useState } from 'react'
+import UploadView, { type ScanSettings } from './components/UploadView'
+import FaceSelectView, { type FaceChoice } from './components/FaceSelectView'
 import ProgressView from './components/ProgressView'
 import ResultView from './components/ResultView'
 import EvidenceView from './components/EvidenceView'
 import SettingsView from './components/SettingsView'
-import { api } from './api/client'
-import type { CaseResult, SSEEvent } from './types/api'
+import { api, ApiError } from './api/client'
+import type { CaseResult, FaceDetectResponse, SSEEvent } from './types/api'
 
-export type View = 'upload' | 'progress' | 'result' | 'evidence' | 'settings'
+export type View = 'upload' | 'faces' | 'progress' | 'result' | 'evidence' | 'settings'
+
+interface PendingSelection {
+  previewUrl: string
+  detection: FaceDetectResponse
+  settings: ScanSettings
+}
 
 export interface ScanState {
   caseId: string
@@ -18,104 +25,75 @@ export interface ScanState {
 }
 
 export default function App() {
-  const [view, setView]   = useState<View>('upload')
-  const [scan, setScan]   = useState<ScanState | null>(null)
-
-  // Keep SSE subscription at App level so it survives view changes
-  const sseCloseRef  = useRef<(() => void) | null>(null)
-  const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const deadRef      = useRef(false)
-
-  // Clean up any active SSE/poll when a new scan starts or component unmounts
-  function _cleanup() {
-    deadRef.current = true
-    if (pollTimerRef.current) { clearTimeout(pollTimerRef.current); pollTimerRef.current = null }
-    if (sseCloseRef.current)  { sseCloseRef.current(); sseCloseRef.current = null }
-  }
-
-  useEffect(() => () => _cleanup(), []) // cleanup on unmount
-
-  const fetchResult = useCallback(async (caseId: string) => {
-    for (let i = 0; i < 20 && !deadRef.current; i++) {
-      try {
-        const result = await api.getResult(caseId)
-        if (!deadRef.current) {
-          setScan((s) => s ? { ...s, result, done: true } : s)
-          setView('result')
-        }
-        return
-      } catch {
-        await new Promise((r) => setTimeout(r, 800))
-      }
-    }
-    if (!deadRef.current) {
-      setScan((s) => s ? { ...s, done: true, failed: true } : s)
-      setView('result')
-    }
-  }, [])
-
-  const pollUntilDone = useCallback((caseId: string) => {
-    let tries = 0
-    const tick = async () => {
-      if (deadRef.current) return
-      try {
-        const st = await api.getStatus(caseId)
-        if (st.status === 'done') { fetchResult(caseId); return }
-        if (st.status === 'failed') {
-          if (!deadRef.current) {
-            setScan((s) => s ? { ...s, done: true, failed: true } : s)
-            setView('result')
-          }
-          return
-        }
-      } catch { /* hiccup */ }
-      if (++tries < 240 && !deadRef.current) {
-        pollTimerRef.current = setTimeout(tick, 1500)
-      }
-    }
-    pollTimerRef.current = setTimeout(tick, 1500)
-  }, [fetchResult])
+  const [view, setView] = useState<View>('upload')
+  const [scan, setScan] = useState<ScanState | null>(null)
+  const [pending, setPending] = useState<PendingSelection | null>(null)
+  const [selectError, setSelectError] = useState<string | null>(null)
+  const [startingScan, setStartingScan] = useState(false)
 
   function onScanStarted(caseId: string) {
-    _cleanup()
-    deadRef.current = false
-
+    releasePending()
     setScan({ caseId, events: [], result: null, done: false, failed: false })
     setView('progress')
+  }
 
-    // Start SSE at App level — survives view unmounts
-    sseCloseRef.current = api.subscribeEvents(
-      caseId,
-      (evt) => {
-        if (deadRef.current) return
-        setScan((s) => s ? { ...s, events: [...s.events, evt] } : s)
-      },
-      () => {
-        // SSE stream ended cleanly (stage=done received)
-        if (deadRef.current) return
-        fetchResult(caseId)
-      },
-      () => {
-        // SSE error — fall back to polling
-        if (deadRef.current) return
-        pollUntilDone(caseId)
-      },
-    )
+  function releasePending() {
+    setPending((p) => {
+      if (p) URL.revokeObjectURL(p.previewUrl)
+      return null
+    })
+  }
 
-    // Safety fallback: start polling after 8s in case SSE never fires onDone
-    pollTimerRef.current = setTimeout(() => {
-      if (!deadRef.current) {
-        setScan((s) => {
-          // Only kick off poll if scan isn't done yet
-          if (s && !s.done) pollUntilDone(caseId)
-          return s
-        })
-      }
-    }, 8000)
+  function onSelectFace(file: File, detection: FaceDetectResponse, settings: ScanSettings) {
+    setSelectError(null)
+    setPending({ previewUrl: URL.createObjectURL(file), detection, settings })
+    setView('faces')
+  }
+
+  async function onFaceConfirmed(choice: FaceChoice) {
+    if (!pending) return
+    setStartingScan(true)
+    setSelectError(null)
+    try {
+      const fd = new FormData()
+      fd.append('upload_id', pending.detection.upload_id)
+      fd.append('engines', pending.settings.engines.join(','))
+      fd.append('no_chain', pending.settings.noChain ? 'true' : 'false')
+      fd.append('chain_mode', pending.settings.noChain ? 'skip' : 'onchain')
+      fd.append('user_declaration', 'true')
+      fd.append('selection_mode', choice.mode)
+      if (choice.faceIndex !== null) fd.append('face_index', String(choice.faceIndex))
+      if (choice.crop) fd.append('crop', choice.crop.join(','))
+      const res = await api.startScan(fd)
+      onScanStarted(res.case_id)
+    } catch (e) {
+      setSelectError(
+        e instanceof ApiError
+          ? `Server error ${e.status}: ${e.message}`
+          : 'Network error — is the backend running?',
+      )
+    } finally {
+      setStartingScan(false)
+    }
+  }
+
+  function onEvent(evt: SSEEvent) {
+    setScan((s) => s ? { ...s, events: [...s.events, evt] } : s)
+  }
+
+  function onDone(result: CaseResult) {
+    setScan((s) => s ? { ...s, result, done: true } : s)
+    setView('result')
+  }
+
+  function onFailed() {
+    setScan((s) => s ? { ...s, done: true, failed: true } : s)
+    setView('result')
   }
 
   function onReset() {
-    _cleanup()
+    releasePending()
+    setSelectError(null)
     setScan(null)
     setView('upload')
   }
@@ -147,12 +125,32 @@ export default function App() {
 
       <main className="max-w-5xl mx-auto px-4 py-8">
         {view === 'upload' && (
-          <UploadView onScanStarted={onScanStarted} />
+          <UploadView onScanStarted={onScanStarted} onSelectFace={onSelectFace} />
+        )}
+        {view === 'faces' && pending && (
+          <>
+            {selectError && (
+              <div role="alert" className="mb-4 max-w-3xl mx-auto text-danger text-sm px-3 py-2
+                bg-red-900/20 rounded border border-danger/30">
+                {selectError}
+              </div>
+            )}
+            <FaceSelectView
+              previewUrl={pending.previewUrl}
+              detection={pending.detection}
+              onConfirm={onFaceConfirmed}
+              onCancel={onReset}
+              busy={startingScan}
+            />
+          </>
         )}
         {view === 'progress' && scan && (
           <ProgressView
             caseId={scan.caseId}
             events={scan.events}
+            onEvent={onEvent}
+            onDone={onDone}
+            onFailed={onFailed}
           />
         )}
         {view === 'result' && scan && (
@@ -180,9 +178,15 @@ export default function App() {
 }
 
 function NavBtn({
-  children, active, onClick, disabled,
+  children,
+  active,
+  onClick,
+  disabled,
 }: {
-  children: React.ReactNode; active: boolean; onClick: () => void; disabled?: boolean
+  children: React.ReactNode
+  active: boolean
+  onClick: () => void
+  disabled?: boolean
 }) {
   return (
     <button

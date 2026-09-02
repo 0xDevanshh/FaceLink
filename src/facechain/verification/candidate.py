@@ -28,6 +28,7 @@ from ..face.encoder import decode_image
 from ..face.detector import load_backend
 from ..face.similarity import best_cosine
 from ..models import SearchCandidate, VerifiedCandidate
+from ..search.base import canonicalise_url, classify_platform
 from ..security.ssrf import SSRFViolation, safe_url_or_none
 from .image_similarity import compare, perceptual_hashes
 from .social import metadata_consistency
@@ -109,6 +110,31 @@ def _jsonld_images(soup: BeautifulSoup) -> list[str]:
     return out
 
 
+def _github_images(soup: BeautifulSoup) -> list[str]:
+    """Public avatar/profile images on a GitHub page.
+
+    Worth handling specially: GitHub's `og:image` for a profile is a *generated
+    summary card* — the avatar shrunk into a banner with text around it — which
+    is a poor input for face comparison. The real avatar is served full-size
+    from `avatars.githubusercontent.com` and referenced directly in the markup,
+    so preferring it measures the actual photograph rather than a thumbnail
+    composited into a card.
+    """
+    out: list[str] = []
+    selectors = (
+        "img.avatar-user",
+        "a[itemprop='image'] img",
+        "img.avatar",
+        "img[data-testid='github-avatar']",
+    )
+    for sel in selectors:
+        for tag in soup.select(sel):
+            src = tag.get("src") or tag.get("data-src")
+            if src:
+                out.append(src)
+    return out
+
+
 def extract_image_urls(html: str, page_url: str) -> list[tuple[str, str]]:
     """Return `(image_url, source_label)` in descending order of trust."""
     soup = BeautifulSoup(html, "lxml")
@@ -117,6 +143,12 @@ def extract_image_urls(html: str, page_url: str) -> list[tuple[str, str]]:
     def add(url: str | None, label: str) -> None:
         if url and url.strip():
             found.append((urljoin(page_url, url.strip()), label))
+
+    # Platform-specific, highest-trust sources first.
+    _, platform, _ = classify_platform(page_url)
+    if platform == "GitHub":
+        for src in _github_images(soup):
+            add(src, "github:avatar")
 
     for prop, label in (
         ("og:image:secure_url", "og:image"),
@@ -159,6 +191,38 @@ def extract_image_urls(html: str, page_url: str) -> list[tuple[str, str]]:
     return ordered
 
 
+class MediaCache:
+    """Per-run cache of downloaded candidate images, keyed by URL.
+
+    Engines routinely return several pages that all display the same CDN image,
+    and the same avatar is referenced from a profile, an org page and a
+    contributor list. Downloading those bytes once per run is both faster and
+    politer to the hosts involved. Bounded so a large scan cannot grow it
+    without limit.
+    """
+
+    def __init__(self, max_entries: int = 64, max_bytes: int = 64 * 1024 * 1024) -> None:
+        self._store: dict[str, bytes | None] = {}
+        self._max_entries = max_entries
+        self._max_bytes = max_bytes
+        self._bytes = 0
+        self.hits = 0
+        self.downloads = 0
+
+    def get_or_fetch(self, client: httpx.Client, url: str) -> bytes | None:
+        if url in self._store:
+            self.hits += 1
+            return self._store[url]
+        self.downloads += 1
+        data = _download_image(client, url)
+        # Negative results are cached too: a URL that failed SSRF or returned a
+        # non-image will fail identically for every candidate that references it.
+        if len(self._store) < self._max_entries and self._bytes < self._max_bytes:
+            self._store[url] = data
+            self._bytes += len(data or b"")
+        return data
+
+
 def _download_image(client: httpx.Client, url: str, referer: str | None = None) -> bytes | None:
     """SSRF-safe image download with content-type and size validation."""
     safe = safe_url_or_none(url)
@@ -187,6 +251,7 @@ def verify_candidate(
     candidate: SearchCandidate,
     input_hashes: dict[str, str],
     input_embedding: np.ndarray,
+    cache: MediaCache | None = None,
 ) -> VerifiedCandidate:
     """Fetch, download, and locally re-measure one candidate."""
     vc = VerifiedCandidate(
@@ -195,7 +260,11 @@ def verify_candidate(
         domain=candidate.domain,
         platform=candidate.platform,
         is_social=candidate.is_social,
+        canonical_url=canonicalise_url(candidate.url),
+        platform_priority=candidate.platform_priority,
+        candidate_type=candidate.candidate_type,
     )
+    cache = cache if cache is not None else MediaCache()
 
     # SSRF check the candidate URL before fetching.
     if safe_url_or_none(candidate.url) is None:
@@ -216,6 +285,13 @@ def verify_candidate(
                     vc.fetched = True
                     image_targets = extract_image_urls(raw, final_url or candidate.url)
                     vc.fetch_note = f"HTTP 200, {len(image_targets)} image refs"
+                elif ctype.split(";")[0].strip().lower() in CONTENT_TYPE_ALLOWLIST:
+                    # The candidate URL *is* the image — a GitHub avatar or a
+                    # CDN asset an engine surfaced directly. Compare it as-is
+                    # rather than discarding a perfectly good measurement.
+                    vc.fetched = True
+                    image_targets = [(final_url or candidate.url, "direct-image")]
+                    vc.fetch_note = f"HTTP 200, direct image ({ctype})"
                 else:
                     vc.fetch_note = f"HTTP 200 but content-type={ctype!r}"
             elif resp is not None:
@@ -235,7 +311,7 @@ def verify_candidate(
 
         best: tuple[float, bytes, str, str] | None = None
         for url, label in image_targets[:8]:
-            data = _download_image(client, url, referer=candidate.url)
+            data = cache.get_or_fetch(client, url)
             if data is None:
                 continue
             try:

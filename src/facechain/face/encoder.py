@@ -78,6 +78,49 @@ def encode_face(image_bgr: np.ndarray, backend_name: str | None = None):
     return record, primary.embedding, faces
 
 
+def encode_detected(
+    backend, faces: list[DetectedFace], face_index: int | None = None
+) -> tuple[FaceRecord, np.ndarray | None, DetectedFace | None]:
+    """Build the `FaceRecord` for an already-detected face set.
+
+    Split out from `encode_face` so a caller that has run detection once — to
+    offer the faces to an operator — does not have to run it again to embed the
+    one that was chosen. Detection is the expensive half, and running it twice
+    could in principle return a different face set for the same image.
+
+    `face_index` selects a specific detection; `None` keeps the historical
+    "largest face wins" behaviour. An out-of-range index is an error rather
+    than a silent fallback: embedding a different face from the one the operator
+    picked would make the evidence describe the wrong person.
+    """
+    if face_index is None:
+        primary = select_primary(faces)
+    else:
+        if not 0 <= face_index < len(faces):
+            raise IndexError(f"face_index {face_index} out of range (0..{len(faces) - 1})")
+        primary = faces[face_index]
+
+    if primary is None:
+        return (
+            FaceRecord(detected=False, backend=backend.name, model=backend.model_name,
+                       faces_found=0),
+            None,
+            None,
+        )
+
+    record = FaceRecord(
+        detected=True,
+        backend=backend.name,
+        model=backend.model_name,
+        faces_found=len(faces),
+        bbox=[int(v) for v in primary.bbox],
+        det_score=round(float(primary.det_score), 4),
+        embedding_dimension=int(primary.embedding.size),
+        embedding_sha256=embedding_hash(primary.embedding),
+    )
+    return record, primary.embedding, primary
+
+
 def crop_face(image_bgr: np.ndarray, face: DetectedFace, margin: float = 0.25) -> np.ndarray:
     """Crop with margin — used to save a visual artefact into the evidence bundle."""
     h, w = image_bgr.shape[:2]

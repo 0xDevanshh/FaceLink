@@ -78,6 +78,11 @@ class EvidenceWriter:
         best = case.best_match
         from .hashing import sha256_text
 
+        selection = case.face_selection
+        providers = {}
+        if case.reverse_search:
+            providers = {p.engine: p.status.value for p in case.reverse_search.providers}
+
         return AttestedPayload(
             case_id=case.case_id,
             observed_at=case.observed_at,
@@ -96,6 +101,14 @@ class EvidenceWriter:
             match_score=q3(best.final_score),
             match_type=best.match_type,
             stages_passed=[s.value for s in best.stages],
+            # Anchored on-chain through `evidenceHash` rather than through the
+            # schema, which stays exactly as registered.
+            candidate_type=best.candidate_type.value,
+            confidence_band=best.confidence_band,
+            verification_rung=best.stages[-1].value if best.stages else "",
+            face_selection_mode=selection.mode if selection else "auto",
+            face_crop_sha256=(selection.crop_sha256 or "") if selection else "",
+            provider_summary=providers,
         )
 
     def write_payload(self, payload: AttestedPayload) -> tuple[Path, str]:
@@ -120,8 +133,24 @@ class EvidenceWriter:
                 case.face.embedding_sha256,
                 f"{case.face.model} embedding ({case.face.embedding_dimension}-D, little-endian float32)",
             )
+        if case.face_selection:
+            # Which face, chosen how, and what the untouched original hashed to.
+            self.save_json("face_selection.json", case.face_selection)
+            if case.face_selection.crop_sha256:
+                self.save_digest(
+                    "selected_crop.sha256",
+                    case.face_selection.crop_sha256,
+                    "artifacts/selected_crop.png (operator-selected region)",
+                )
         if case.reverse_search:
             self.save_json("reverse_search.json", case.reverse_search)
+            self.save_json(
+                "search_providers.json",
+                {"providers": [p.rounded().model_dump(mode="json")
+                               for p in case.reverse_search.providers],
+                 "platform_counts": case.reverse_search.platform_counts,
+                 "timed_out": case.reverse_search.timed_out},
+            )
         if case.verification:
             self.save_json(
                 "verification.json",
@@ -149,14 +178,40 @@ class EvidenceWriter:
             f"Pipeline version : {case.pipeline_version}",
             f"Verdict          : {case.verdict}",
             f"Observed at      : {case.observed_at} (unix)",
-            "",
-            "MATCH",
-            "-" * 62,
         ]
+
+        if case.face_selection:
+            sel = case.face_selection
+            lines += [
+                "",
+                "FACE SELECTION",
+                "-" * 62,
+                f"Mode             : {sel.mode}"
+                + (f" (face #{sel.face_index})" if sel.face_index is not None else ""),
+                f"Faces offered    : {sel.faces_offered}",
+                f"Original sha256  : {sel.original_sha256 or 'n/a'}",
+                f"Original size    : {sel.original_width}x{sel.original_height}",
+                f"Crop rect        : {sel.crop_rect or 'none — original used unmodified'}",
+                f"Crop sha256      : {sel.crop_sha256 or 'n/a'}",
+            ]
+
+        if case.reverse_search and case.reverse_search.providers:
+            lines += ["", "SEARCH PROVIDERS", "-" * 62]
+            for p in case.reverse_search.providers:
+                detail = f"{p.candidates} candidates" if p.candidates else (p.error or "—")
+                lines.append(f"{p.engine:<17}: {p.status.value:<15} {p.duration_s:>6.1f}s  {detail}")
+            counts = case.reverse_search.platform_counts
+            if counts:
+                lines.append("Platform counts  : "
+                             + ", ".join(f"{k}={v}" for k, v in counts.items()))
+
+        lines += ["", "MATCH", "-" * 62]
         if best:
             lines += [
                 f"Matched URL      : {best.url}",
                 f"Platform         : {best.platform or 'n/a'}",
+                f"Candidate type   : {best.candidate_type.value}",
+                f"Confidence band  : {best.confidence_band}",
                 f"Found via        : {best.engine}",
                 f"Image similarity : {best.image_similarity:.3f}",
                 f"Face similarity  : {best.face_similarity:.3f}",

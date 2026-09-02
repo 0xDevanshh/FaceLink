@@ -4,6 +4,12 @@ import userEvent from '@testing-library/user-event'
 import UploadView from '../components/UploadView'
 
 // Mock the API client — no real backend needed.
+//
+// `detectFaces` returns one clearly usable face, i.e. the unambiguous case, so
+// these tests exercise the straight-through path. The ambiguous path (which
+// hands off to face selection instead) is covered in FaceSelectView.test.tsx.
+// `vi.mock` is hoisted above the imports, so everything it references has to
+// live inside the factory.
 vi.mock('../api/client', () => ({
   api: {
     startScan: vi.fn().mockResolvedValue({
@@ -12,7 +18,24 @@ vi.mock('../api/client', () => ({
       events_url: '/api/v1/scan/case_20260901_000001_aabbccdd/events',
       result_url: '/api/v1/scan/case_20260901_000001_aabbccdd/result',
     }),
+    detectFaces: vi.fn().mockResolvedValue({
+      upload_id: 'upl_deadbeefdeadbeef',
+      sha256: 'ab'.repeat(32),
+      image_width: 800,
+      image_height: 1200,
+      faces: [{ index: 0, bbox: [100, 150, 300, 400], det_score: 0.94, face_px: 200, area: 50000, usable: true, note: '' }],
+      auto_index: 0,
+      selection_required: false,
+      reason: '',
+      quality: { passed: true, error: null, detail: '', blur_score: 120.5, face_px: 200, face_count: 1 },
+    }),
     health: vi.fn().mockResolvedValue({ status: 'ok', version: '1.0.0', engines_configured: {} }),
+    chainStatus: vi.fn().mockResolvedValue({
+      network: 'ethereum-sepolia', network_name: 'Ethereum Sepolia', chain_id: 11155111,
+      eas_contract: '0x' + '11'.repeat(20), signer_configured: true, rpc_reachable: true,
+      schema_registered: true, schema_uid: '0x' + 'aa'.repeat(32),
+      attester: '0x' + '22'.repeat(20), balance_eth: 0.05, ready: true, note: '',
+    }),
   },
   ApiError: class ApiError extends Error {
     constructor(public status: number, msg: string) { super(msg) }
