@@ -81,30 +81,44 @@ export const api = {
     return _fetch('/api/v1/verify', { method: 'POST', body: fd })
   },
 
-  /** Subscribe to SSE stream. Returns an EventSource and a cleanup fn. */
+  /**
+   * Open SSE stream. Returns a cleanup function.
+   * The server tail-follows job.events — late connections get full replay.
+   * onDone fires when stage==="done"|"error"; onError fires on connection failure.
+   */
   subscribeEvents(
     caseId: string,
     onEvent: (e: SSEEvent) => void,
     onDone: () => void,
     onError: (err: Event) => void,
   ): () => void {
-    const es = new EventSource(`${BASE}/api/v1/scan/${encodeURIComponent(caseId)}/events`)
+    const url = `${BASE}/api/v1/scan/${encodeURIComponent(caseId)}/events`
+    const es  = new EventSource(url)
+
+    es.addEventListener('open', () => {
+      console.log('[SSE] connected', caseId)
+    })
+
     es.onmessage = (ev) => {
       try {
         const data = JSON.parse(ev.data) as SSEEvent
+        if (data.stage === 'ping') return   // keepalive — ignore
         onEvent(data)
         if (data.stage === 'done' || data.stage === 'error') {
           es.close()
           onDone()
         }
       } catch {
-        // ignore malformed events
+        /* ignore parse errors */
       }
     }
+
     es.onerror = (err) => {
+      console.warn('[SSE] error', err)
       es.close()
       onError(err)
     }
+
     return () => es.close()
   },
 }

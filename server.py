@@ -497,6 +497,10 @@ async def _run_pipeline_background(case_id: str) -> None:
         job.push("error", "fail", job.error)
 
 
+async def _launch(case_id: str) -> None:
+    await _run_pipeline_background(case_id)
+
+
 @app.get("/api/v1/scan/{case_id}/status")
 async def scan_status(case_id: str) -> dict:
     try:

@@ -110,9 +110,9 @@ const STATUS_COLOR: Record<StageStatus, string> = {
 interface Props {
   caseId: string
   events: SSEEvent[]
-  onEvent: (e: SSEEvent) => void
-  onDone: (result: CaseResult) => void
-  onFailed: () => void
+  onEvent?: (e: SSEEvent) => void
+  onDone?: (result: CaseResult) => void
+  onFailed?: () => void
 }
 
 export default function ProgressView({ caseId, events, onEvent, onDone, onFailed }: Props) {
@@ -120,6 +120,10 @@ export default function ProgressView({ caseId, events, onEvent, onDone, onFailed
   const closerRef = useRef<(() => void) | null>(null)
 
   useEffect(() => {
+    if (!onEvent || !onDone || !onFailed) {
+      return () => {}
+    }
+
     // No "already subscribed" guard here, deliberately.
     //
     // React 18 StrictMode runs an effect mount → cleanup → mount. A guard that
@@ -178,14 +182,27 @@ export default function ProgressView({ caseId, events, onEvent, onDone, onFailed
   const candidates = candidateLines(events)
   const isDone = events.some((e) => e.stage === 'done' || e.stage === 'error')
   const failedEvent = events.find((e) => e.stage === 'error')
+  const eventCount = events.length
 
   return (
     <div className="max-w-3xl mx-auto" aria-live="polite" aria-label="Scan progress">
-      <h1 className="text-2xl font-bold text-accent mb-1">Scanning…</h1>
+      <div className="flex items-center justify-between mb-1">
+        <h1 className="text-2xl font-bold text-accent">
+          {isDone ? 'Scan complete' : 'Scanning…'}
+        </h1>
+        {isDone && !failedEvent && <span className="text-success text-sm font-mono">● Done</span>}
+        {failedEvent && <span className="text-danger text-sm font-mono">● Stopped</span>}
+        {!isDone && eventCount > 0 && (
+          <span className="text-muted text-xs font-mono animate-pulse">
+            {eventCount} event{eventCount !== 1 ? 's' : ''} received
+          </span>
+        )}
+        {!isDone && eventCount === 0 && (
+          <span className="text-warn text-xs font-mono animate-pulse">waiting for pipeline…</span>
+        )}
+      </div>
       <p className="text-muted text-sm mb-6">
         Case <span className="font-mono text-gray-300">{caseId}</span>
-        {isDone && !failedEvent && <span className="ml-3 text-success">● Complete</span>}
-        {failedEvent && <span className="ml-3 text-danger">● Stopped</span>}
       </p>
 
       {/* A terminal error is stated here rather than left implicit: the stream
@@ -288,7 +305,13 @@ export default function ProgressView({ caseId, events, onEvent, onDone, onFailed
             aria-live="polite"
           >
             {candidates.map((line, i) => (
-              <div key={i} className="text-gray-300 truncate" title={line}>{line}</div>
+              <div
+                key={i}
+                className={`truncate ${line.includes('VERIFIED') ? 'text-success' : 'text-gray-400'}`}
+                title={line}
+              >
+                {line}
+              </div>
             ))}
           </div>
         </section>
