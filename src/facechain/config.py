@@ -92,7 +92,13 @@ EAS_SCHEMA_DEFINITION = (
     "string pipelineVersion"
 )
 
-# Social platforms we accept as a "social media post".
+# Platforms we recognise by exact hostname (or a genuine subdomain of one).
+#
+# "social" here means "a platform we can name", which is why GitHub is in the
+# table: it is a first-class discovery target for this pipeline, and naming the
+# platform is what lets the ranker prioritise it and the evidence record where a
+# match came from. Recognition is never evidence of identity — every candidate
+# still has to pass the face-verification ladder.
 SOCIAL_DOMAINS: dict[str, str] = {
     "instagram.com": "Instagram",
     "facebook.com": "Facebook",
@@ -111,8 +117,84 @@ SOCIAL_DOMAINS: dict[str, str] = {
     "mastodon.social": "Mastodon",
     "bsky.app": "Bluesky",
     "youtube.com": "YouTube",
+    "youtu.be": "YouTube",
     "flickr.com": "Flickr",
+    # GitHub is a primary discovery target: profiles, avatars and org/contributor
+    # pages are public and frequently indexed by reverse-image engines. The
+    # user-content hosts are where the actual avatar/image bytes live, so they
+    # must classify to the same platform as the page that referenced them.
+    "github.com": "GitHub",
+    "githubusercontent.com": "GitHub",
+    "github.io": "GitHub",
 }
+
+# ---------------------------------------------------------------------------
+# Platform-owned media CDNs.
+#
+# These are a *separate registrable domain* from the platform's site, and that
+# distinction was quietly costing real discoveries: a reverse-image engine that
+# finds a LinkedIn profile photo returns `media.licdn.com/...`, not
+# `linkedin.com/in/...`, because the CDN is where the pixels live. Matching only
+# the site domain filed every such hit as unrecognised "Other Web" at the lowest
+# discovery priority — so the platform a match came from was both mis-reported
+# and de-prioritised for verification.
+#
+# Only CDNs that belong to exactly one platform are listed. `fbcdn.net` is
+# deliberately absent: it serves both Facebook and Instagram, and guessing which
+# would put a claim in the evidence that the URL does not support.
+# ---------------------------------------------------------------------------
+PLATFORM_MEDIA_DOMAINS: dict[str, str] = {
+    "licdn.com": "LinkedIn",             # media.licdn.com, static.licdn.com
+    "cdninstagram.com": "Instagram",
+    "twimg.com": "X/Twitter",            # pbs.twimg.com, abs.twimg.com
+    "githubusercontent.com": "GitHub",
+    "ggpht.com": "YouTube",              # yt3.ggpht.com — channel avatars
+    "ytimg.com": "YouTube",              # i.ytimg.com — video thumbnails
+    "pinimg.com": "Pinterest",
+    "tiktokcdn.com": "TikTok",
+    "tiktokcdn-us.com": "TikTok",
+    "redditmedia.com": "Reddit",
+    "redd.it": "Reddit",
+}
+
+# GitHub hosts that serve image bytes rather than pages. Kept explicit so
+# candidate typing can tell "an avatar file" from "a profile page".
+GITHUB_MEDIA_HOSTS = frozenset({
+    "avatars.githubusercontent.com",
+    "user-images.githubusercontent.com",
+    "raw.githubusercontent.com",
+    "camo.githubusercontent.com",
+    "media.githubusercontent.com",
+})
+
+# ---------------------------------------------------------------------------
+# Discovery priority.
+#
+# Priority orders *where we look first and which leads we spend fetch budget
+# on*. It never orders truth: a candidate's verification strength always
+# outranks its platform (see verification/scorer.rank), so a strongly verified
+# personal website beats an unverified LinkedIn profile. Lower number = looked
+# at earlier.
+# ---------------------------------------------------------------------------
+PLATFORM_PRIORITY: dict[str, int] = {
+    "LinkedIn": 1,
+    "Instagram": 2,
+    "X/Twitter": 3,
+    "GitHub": 4,
+    "YouTube": 5,
+}
+# A platform we can name but that is not in the priority list (Facebook,
+# Reddit, TikTok…). Still ahead of the unrecognised web.
+RECOGNISED_PLATFORM_PRIORITY = 20
+# Anything else on the public web. Searched and verified like everything else.
+OTHER_WEB_PRIORITY = 90
+
+
+def platform_priority(platform: str | None) -> int:
+    """Discovery rank for a platform name. Unknown/None → the wider web."""
+    if not platform:
+        return OTHER_WEB_PRIORITY
+    return PLATFORM_PRIORITY.get(platform, RECOGNISED_PLATFORM_PRIORITY)
 
 
 class Settings(BaseSettings):
@@ -148,6 +230,15 @@ class Settings(BaseSettings):
     engines: str = "yandex,bing,google_lens"
     headless: bool = True
     search_timeout_s: int = 60
+    # Hard wall-clock ceiling for one provider. `search_timeout_s` bounds
+    # individual browser operations; this bounds the whole adapter, so an engine
+    # that hangs between operations still cannot stall the scan.
+    engine_timeout_s: int = 120
+    # Hard ceiling for the entire search stage across all providers.
+    search_total_timeout_s: int = 300
+    # How many providers may run at once. Each browser provider owns its own
+    # Chromium, so this is also a cap on concurrent browser processes.
+    search_concurrency: int = 3
     max_candidates_per_engine: int = 60
     # Optional: turn a local file into a public URL so engines' by-URL search
     # endpoints can be used (far more reliable than their upload flows).

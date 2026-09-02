@@ -37,18 +37,53 @@ function buildStageMap(events: SSEEvent[]): Record<string, StageState> {
   return map
 }
 
-function engineChips(events: SSEEvent[]): { name: string; status: StageStatus; detail: string }[] {
-  const engines: Record<string, { status: StageStatus; detail: string }> = {}
+// Provider states that are refusals or configuration gaps rather than errors:
+// worth showing as a warning, not as a failure of the scan.
+const SOFT_PROVIDER_STATES = ['CHALLENGED', 'RATE_LIMITED', 'TIMEOUT', 'NOT_CONFIGURED',
+  'NO_RESULTS', 'CANCELLED']
+
+/**
+ * Provider chips.
+ *
+ * The backend prefixes every provider event with `search:<engine>` and puts the
+ * terminal `ProviderStatus` at the head of the detail string, so the label a
+ * user sees is the same word recorded in the evidence bundle — CHALLENGED and
+ * TIMEOUT stay distinguishable instead of collapsing into "failed".
+ */
+function engineChips(events: SSEEvent[]): {
+  name: string; status: StageStatus; detail: string; providerStatus: string
+}[] {
+  const engines: Record<string, { status: StageStatus; detail: string; providerStatus: string }> = {}
   for (const evt of events) {
     if (!evt.stage.startsWith('search:')) continue
     const name = evt.stage.slice(7)
-    if (!engines[name]) engines[name] = { status: 'idle', detail: '' }
-    if (evt.status === 'start') engines[name].status = 'running'
-    else if (evt.status === 'ok') engines[name].status = 'ok'
-    else if (evt.status === 'fail') engines[name].status = 'fail'
-    if (evt.detail) engines[name].detail = evt.detail
+    if (name === 'platform') continue // platform tallies are not providers
+    if (!engines[name]) engines[name] = { status: 'idle', detail: '', providerStatus: '' }
+    const e = engines[name]
+    if (evt.status === 'start') e.status = 'running'
+    else if (evt.status === 'ok') e.status = 'ok'
+    else if (evt.status === 'fail') e.status = 'fail'
+    if (evt.detail) {
+      e.detail = evt.detail
+      const head = evt.detail.split(/[:·]/)[0].trim()
+      if (/^[A-Z_]+$/.test(head)) {
+        e.providerStatus = head
+        if (SOFT_PROVIDER_STATES.includes(head)) e.status = 'skip'
+      }
+    }
   }
   return Object.entries(engines).map(([name, v]) => ({ name, ...v }))
+}
+
+function platformTallies(events: SSEEvent[]): string[] {
+  // Last snapshot wins; the backend emits one event per platform after search.
+  const seen = new Map<string, string>()
+  for (const evt of events) {
+    if (evt.stage !== 'search:platform' || !evt.detail) continue
+    const [name] = evt.detail.split(':')
+    seen.set(name.trim(), evt.detail)
+  }
+  return [...seen.values()]
 }
 
 function candidateLines(events: SSEEvent[]): string[] {
@@ -85,10 +120,17 @@ export default function ProgressView({ caseId, events, onEvent, onDone, onFailed
   const closerRef = useRef<(() => void) | null>(null)
 
   useEffect(() => {
-    if (closerRef.current) return // already subscribed
+    // No "already subscribed" guard here, deliberately.
+    //
+    // React 18 StrictMode runs an effect mount → cleanup → mount. A guard that
+    // returned early on the second mount left the EventSource closed by the
+    // first cleanup and never reopened — the scan ran to completion on the
+    // server while the UI sat on "Scanning…" forever with every stage idle.
+    // Subscribing on every run and tearing down in the cleanup is the correct
+    // shape; the per-run `dead` flag stops a stale run from touching state.
     let dead = false
 
-    closerRef.current = api.subscribeEvents(
+    const close = api.subscribeEvents(
       caseId,
       (evt) => {
         if (dead) return
@@ -118,9 +160,10 @@ export default function ProgressView({ caseId, events, onEvent, onDone, onFailed
       () => { if (!dead) { dead = true; onFailed() } },
     )
 
+    closerRef.current = close
     return () => {
       dead = true
-      closerRef.current?.()
+      close()
     }
   }, [caseId]) // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -131,16 +174,27 @@ export default function ProgressView({ caseId, events, onEvent, onDone, onFailed
 
   const stageMap = buildStageMap(events)
   const chips = engineChips(events)
+  const platforms = platformTallies(events)
   const candidates = candidateLines(events)
   const isDone = events.some((e) => e.stage === 'done' || e.stage === 'error')
+  const failedEvent = events.find((e) => e.stage === 'error')
 
   return (
     <div className="max-w-3xl mx-auto" aria-live="polite" aria-label="Scan progress">
       <h1 className="text-2xl font-bold text-accent mb-1">Scanning…</h1>
       <p className="text-muted text-sm mb-6">
         Case <span className="font-mono text-gray-300">{caseId}</span>
-        {isDone && <span className="ml-3 text-success">● Complete</span>}
+        {isDone && !failedEvent && <span className="ml-3 text-success">● Complete</span>}
+        {failedEvent && <span className="ml-3 text-danger">● Stopped</span>}
       </p>
+
+      {/* A terminal error is stated here rather than left implicit: the stream
+          always reaches an end state, and the reason for it is shown. */}
+      {failedEvent && (
+        <div role="alert" className="mb-6 border border-danger/50 bg-red-900/10 rounded px-4 py-3 text-sm text-danger">
+          {failedEvent.detail || 'The scan stopped before producing a result.'}
+        </div>
+      )}
 
       {/* Stage stepper */}
       <ol className="space-y-2 mb-8" aria-label="Pipeline stages">
@@ -190,14 +244,32 @@ export default function ProgressView({ caseId, events, onEvent, onDone, onFailed
                 title={chip.detail}
                 className={`px-3 py-1 rounded-full text-xs font-mono border
                   ${chip.status === 'ok' ? 'border-success/60 text-success bg-green-900/10' :
+                    chip.status === 'skip' ? 'border-warn/60 text-warn bg-yellow-900/10' :
                     chip.status === 'fail' ? 'border-danger/60 text-danger bg-red-900/10' :
                     chip.status === 'running' ? 'border-accent/60 text-accent bg-blue-900/10 animate-pulse' :
                     'border-border text-muted'}`}
-                aria-label={`${chip.name}: ${chip.status}`}
+                aria-label={`${chip.name}: ${chip.providerStatus || chip.status}`}
               >
-                {chip.name} · {chip.status}
-                {chip.detail && <span className="ml-1 opacity-60 text-[10px]">{chip.detail.slice(0, 20)}</span>}
+                {chip.name} · {chip.providerStatus || chip.status}
               </div>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {/* Candidates discovered per platform, priority platforms included even
+          at zero, so "looked and found none" reads differently from "never
+          looked". */}
+      {platforms.length > 0 && (
+        <section className="mb-6" aria-labelledby="platform-heading">
+          <h2 id="platform-heading" className="text-xs font-semibold text-muted uppercase tracking-wider mb-2">
+            Discovery by platform
+          </h2>
+          <div className="flex flex-wrap gap-2" data-testid="progress-platforms">
+            {platforms.map((line) => (
+              <span key={line} className="px-3 py-1 rounded-full text-xs font-mono border border-border text-gray-300">
+                {line}
+              </span>
             ))}
           </div>
         </section>

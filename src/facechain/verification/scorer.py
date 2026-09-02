@@ -13,7 +13,7 @@ retrieved public image under the thresholds recorded in the evidence bundle.
 from __future__ import annotations
 
 from ..config import confidence_band, settings
-from ..models import LADDER, Stage, VerifiedCandidate
+from ..models import LADDER, CandidateType, Stage, VerifiedCandidate
 
 
 def score_candidate(vc: VerifiedCandidate) -> VerifiedCandidate:
@@ -22,21 +22,31 @@ def score_candidate(vc: VerifiedCandidate) -> VerifiedCandidate:
     What VERIFIED requires, and why:
 
       SEARCH_FOUND  the URL came from a real reverse-image engine
-      SOCIAL_MATCH  it is a post on a supported social platform
       FACE_MATCH    the face in the retrieved image matches the input face
       final_score   >= `verify_min_score`, where image similarity carries 40%
 
-    `IMAGE_MATCH` is recorded but deliberately *not* mandatory. Social reposts
-    routinely crop, pad and overlay text, which drops a perceptual hash well
-    below the exact-image bar while the face stays unmistakable — and this is a
-    face-identification task, so the face is the primary signal and the image
-    hash is corroboration. Which of the two held is preserved in `match_type`:
+    `SOCIAL_MATCH` is recorded and drives discovery priority, but it is *not*
+    required. It used to be, and that was wrong for a face-matching tool: it
+    made a strongly face-verified match on a personal site, a university page
+    or a conference programme permanently unverifiable, purely because its
+    domain was absent from a list. Search priority is not search exclusivity —
+    the platform a match was found on is metadata about provenance, not
+    evidence about the face. What the face evidence says is decided by the face
+    measurement alone.
 
-      "exact-image"  the retrieved image is perceptually the same picture
-      "face-only"    same face, visibly different/edited picture
+    `IMAGE_MATCH` is likewise recorded and not mandatory. Reposts routinely
+    crop, pad and overlay text, which drops a perceptual hash well below the
+    exact-image bar while the face stays unmistakable. Which of the two held is
+    preserved in `match_type` and `candidate_type`:
 
-    A wrong person cannot sneak through: with face similarity near zero the
-    composite score cannot reach the threshold on image similarity alone.
+      "exact-image" / EXACT_IMAGE  the retrieved image is the same picture
+      "face-only"   / SAME_FACE    same face, visibly different picture
+
+    A wrong person still cannot sneak through, and the arithmetic guarantees it
+    rather than a policy doing so: with face similarity at zero the remaining
+    weights total 0.5 (image 0.4 + metadata 0.1), below the 0.70 minimum. No
+    combination of a perfect image hash and perfect metadata can verify a face
+    that does not match.
     """
     stages: list[Stage] = [Stage.SEARCH_FOUND]
 
@@ -58,12 +68,13 @@ def score_candidate(vc: VerifiedCandidate) -> VerifiedCandidate:
     )
     vc.confidence_band = confidence_band(vc.face_similarity)
 
-    required = {Stage.SEARCH_FOUND, Stage.SOCIAL_MATCH, Stage.FACE_MATCH}
+    required = {Stage.SEARCH_FOUND, Stage.FACE_MATCH}
     if required.issubset(set(stages)) and vc.final_score >= settings.verify_min_score:
         stages.append(Stage.VERIFIED)
         vc.verified = True
 
     vc.stages = [s for s in LADDER if s in set(stages)]
+    vc.candidate_type = _measured_candidate_type(vc, exact_image, face_ok)
 
     if not vc.verified:
         vc.rejection_reason = _rejection_reason(vc, stages)
@@ -71,15 +82,35 @@ def score_candidate(vc: VerifiedCandidate) -> VerifiedCandidate:
     return vc
 
 
+def _measured_candidate_type(
+    vc: VerifiedCandidate, exact_image: bool, face_ok: bool
+) -> CandidateType:
+    """Upgrade the URL-derived type with what the measurement actually showed.
+
+    EXACT_IMAGE and SAME_FACE are claims about pixels and embeddings, so they
+    are only ever assigned here, after both comparisons have run. A candidate we
+    could not measure keeps the provisional type it got from its URL, which
+    stays honest about the fact that nothing was measured.
+    """
+    if exact_image:
+        return CandidateType.EXACT_IMAGE
+    if face_ok:
+        return CandidateType.SAME_FACE
+    return vc.candidate_type
+
+
+def highest_rung(vc: VerifiedCandidate) -> str:
+    """The furthest ladder rung this candidate reached, as a plain string."""
+    return vc.stages[-1].value if vc.stages else ""
+
+
 def _rejection_reason(vc: VerifiedCandidate, stages: list[Stage]) -> str:
     """Precise reason why this specific candidate was not verified."""
-    if Stage.SOCIAL_MATCH not in stages:
-        return f"not on a supported social platform (domain: {vc.domain})"
     if not vc.candidate_image_sha256:
         return "no comparable image could be retrieved (login wall or bot block)"
     if not vc.face_detected:
         return "no face detectable in the retrieved image"
-    if not vc.face_detected or vc.face_similarity < settings.face_match_threshold:
+    if vc.face_similarity < settings.face_match_threshold:
         return (
             f"face similarity {vc.face_similarity:.3f} below threshold "
             f"{settings.face_match_threshold}"
@@ -91,11 +122,41 @@ def _rejection_reason(vc: VerifiedCandidate, stages: list[Stage]) -> str:
     )
 
 
+# Rungs that are claims about the *evidence* rather than about provenance.
+# SOCIAL_MATCH is deliberately absent: which platform a page lives on says
+# nothing about whether the face matches.
+EVIDENTIAL_STAGES = frozenset({Stage.IMAGE_MATCH, Stage.FACE_MATCH, Stage.VERIFIED})
+
+
+def evidential_strength(vc: VerifiedCandidate) -> int:
+    """How many *measured* rungs this candidate climbed."""
+    return sum(1 for s in vc.stages if s in EVIDENTIAL_STAGES)
+
+
 def rank(candidates: list[VerifiedCandidate]) -> list[VerifiedCandidate]:
-    """Best first: verified, then more rungs climbed, then higher score."""
+    """Best first.
+
+    Verification strength dominates; platform priority only ever breaks ties
+    between candidates of equal evidential strength and equal score.
+
+    Counting *evidential* rungs rather than all rungs matters, and a real run
+    showed why: a YouTube channel scoring 0.873 was being ranked above a page
+    scoring 0.940 with a higher face similarity, purely because the YouTube hit
+    also carried SOCIAL_MATCH and so appeared to have climbed one rung further.
+    That is a platform name outranking a measurement, which is precisely what
+    this ordering exists to prevent.
+    """
     return sorted(
         candidates,
-        key=lambda c: (c.verified, len(c.stages), c.final_score, c.face_similarity),
+        key=lambda c: (
+            c.verified,
+            evidential_strength(c),
+            c.final_score,
+            c.face_similarity,
+            # Negated so that a *lower* priority number sorts earlier under the
+            # surrounding reverse=True.
+            -c.platform_priority,
+        ),
         reverse=True,
     )
 
@@ -109,37 +170,42 @@ def highest_stage_reached(candidates: list[VerifiedCandidate]) -> list[Stage]:
 def explain_failure(candidates: list[VerifiedCandidate]) -> str:
     """Say precisely which rung blocked verification.
 
-    The reason must describe the *social* candidates, since only those can ever
-    be verified — reporting the best overall candidate's numbers would claim a
-    threshold failure that never happened (e.g. a non-social page scoring 0.89
-    while the real blocker was that nothing social was found).
+    The reason must be arithmetically true of the candidate it names. A regression
+    this guards against: reporting "final score 0.891 < threshold 0.7", which is
+    false on its face. So the explanation is always derived from the single best
+    candidate we actually measured, and it reports the first gate that candidate
+    genuinely failed.
     """
     if not candidates:
         return "no candidates survived reverse image search"
 
-    social = [c for c in candidates if c.is_social]
-    if not social:
-        best = rank(candidates)[0]
+    # Only unverified candidates can explain a failure to verify. Reporting a
+    # verified candidate's numbers here would produce exactly the falsehood this
+    # function exists to avoid — "score 0.935 < threshold 0.70".
+    unverified = [c for c in candidates if not c.verified]
+    if not unverified:
+        return ""
+
+    candidates = unverified
+    measured = [c for c in candidates if c.candidate_image_sha256]
+
+    if not measured:
+        domains = ", ".join(sorted({c.domain for c in candidates})[:5])
         return (
-            f"{len(candidates)} candidate(s) checked but none on a supported social "
-            f"platform (best non-social: {best.domain} at score {best.final_score:.3f})"
+            f"{len(candidates)} candidate(s) checked but no comparable image could be "
+            f"retrieved from any of them — login walls or bot blocks ({domains})"
         )
 
-    best = rank(social)[0]
-    if not best.candidate_image_sha256:
-        return (
-            f"social candidates found ({', '.join(sorted({c.domain for c in social}))}) but no "
-            "comparable image could be retrieved — login walls or bot blocks on every one"
-        )
+    best = rank(measured)[0]
     if not best.face_detected:
         return f"no face detectable in the image retrieved from {best.domain}"
     if best.face_similarity < settings.face_match_threshold:
         return (
-            f"best social face similarity {best.face_similarity:.3f} < threshold "
+            f"best face similarity {best.face_similarity:.3f} < threshold "
             f"{settings.face_match_threshold} ({best.domain})"
         )
     return (
-        f"best social candidate {best.domain} scored {best.final_score:.3f} < threshold "
+        f"best candidate {best.domain} scored {best.final_score:.3f} < threshold "
         f"{settings.verify_min_score} (face {best.face_similarity:.3f}, "
         f"image {best.image_similarity:.3f})"
     )

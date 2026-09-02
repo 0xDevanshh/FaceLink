@@ -30,9 +30,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from sse_starlette.sse import EventSourceResponse
 
-from facechain.config import settings
+from facechain.config import PLATFORM_PRIORITY, settings
 from facechain.runner import PipelineError, RunOptions, run
-from facechain.security.paths import PathTraversalError, safe_case_id
+from facechain.security.paths import PathTraversalError, safe_case_id, safe_upload_id
 from facechain.security.scrubber import install as install_scrubber, scrub
 
 # ---- startup -------------------------------------------------------------
@@ -106,6 +106,17 @@ class Job:
 _jobs: dict[str, Job] = {}
 _upload_dir = Path(os.environ.get("FACECHAIN_UPLOAD_DIR", "/tmp/facechain_uploads"))
 
+# Staged uploads awaiting a face choice: upload_id -> (path, created_at).
+# Kept separate from jobs because a staged upload is not yet a scan, and it must
+# expire on its own if the operator abandons the selection step.
+_uploads: dict[str, tuple[Path, float]] = {}
+UPLOAD_TTL_S = 1800
+
+# A scan that has not reached a terminal state by this deadline is reported as
+# timed out. Sized above the search stage's own total budget so a slow-but-alive
+# search is never cut short by the watchdog.
+SCAN_DEADLINE_S = max(600, settings.search_total_timeout_s + 300)
+
 
 def _cleanup_jobs() -> None:
     now = time.time()
@@ -116,6 +127,12 @@ def _cleanup_jobs() -> None:
         except Exception:
             pass
         del _jobs[k]
+    for uid in [u for u, (_, ts) in _uploads.items() if now - ts > UPLOAD_TTL_S]:
+        path, _ = _uploads.pop(uid)
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 @asynccontextmanager
@@ -128,6 +145,11 @@ async def lifespan(app_: FastAPI) -> AsyncIterator[None]:
     for job in _jobs.values():
         try:
             job.image_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+    for path, _ in _uploads.values():
+        try:
+            path.unlink(missing_ok=True)
         except Exception:
             pass
 
@@ -183,6 +205,37 @@ def _validate_upload(file: UploadFile, data: bytes) -> None:
         raise HTTPException(422, "File magic bytes do not match a supported image format")
 
 
+def _parse_face_index(raw: str) -> int | None:
+    if not raw.strip():
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        raise HTTPException(422, "face_index must be an integer") from None
+    if value < 0:
+        raise HTTPException(422, "face_index must be >= 0")
+    return value
+
+
+def _parse_crop(raw: str) -> list[int] | None:
+    """Parse `"x,y,width,height"`.
+
+    Rejected here rather than clamped: a malformed rectangle means the client
+    and the server disagree about the image's coordinate space, and cropping
+    *something* would attach a misleading rectangle to the evidence.
+    """
+    text = raw.strip()
+    if not text:
+        return None
+    parts = [p.strip() for p in text.split(",") if p.strip()]
+    if len(parts) != 4:
+        raise HTTPException(422, "crop must be 'x,y,width,height'")
+    try:
+        return [int(float(p)) for p in parts]
+    except ValueError:
+        raise HTTPException(422, "crop values must be numbers") from None
+
+
 def _run_pipeline_sync(job: Job) -> None:
     """Run the pipeline in a thread (called via run_in_executor)."""
     def reporter(stage: str, status: str, detail: str) -> None:
@@ -220,19 +273,152 @@ async def health() -> dict:
         },
         "face_backend": settings.face_backend,
         "chain_mode_default": "skip",
+        # Whether the attestation path is configured at all. Booleans only —
+        # never the key itself.
+        "chain_configured": bool(settings.private_key),
+        "network": settings.network,
+        "chain_id": settings.chain_id,
+        "priority_platforms": list(PLATFORM_PRIORITY),
+        "engine_timeout_s": settings.engine_timeout_s,
+        "search_total_timeout_s": settings.search_total_timeout_s,
     }
+
+
+@app.get("/api/v1/chain/status")
+async def chain_status() -> dict:
+    """Public readiness of the attestation path — no secrets, ever.
+
+    Only public chain data is exposed: the network, the EAS addresses, whether
+    the schema is registered, the attester's *address* and its balance. The
+    private key never appears here, and the endpoint reports configuration state
+    rather than values, so a missing key reads as `signer_configured: false`.
+    """
+    from facechain.chain.schema import schema_uid as predict_schema_uid
+
+    out: dict[str, Any] = {
+        "network": settings.network,
+        "network_name": settings.chain_name,
+        "chain_id": settings.chain_id,
+        "eas_contract": settings.eas_contract,
+        "signer_configured": bool(settings.private_key),
+        "rpc_reachable": False,
+        "schema_registered": False,
+        "schema_uid": None,
+        "attester": None,
+        "balance_eth": None,
+        "ready": False,
+        "note": "",
+    }
+    if not out["signer_configured"]:
+        out["note"] = "PRIVATE_KEY is not configured; attestation is unavailable"
+        return out
+
+    def probe() -> None:
+        from facechain.chain.eas import EasClient
+
+        client = EasClient()
+        out["rpc_reachable"] = True
+        uid = settings.eas_schema_uid or predict_schema_uid()
+        out["schema_uid"] = uid
+        out["schema_registered"] = client._schema_exists(uid)
+        out["attester"] = client.address
+        out["balance_eth"] = round(client.balance_eth(), 6)
+        out["ready"] = bool(out["schema_registered"] and out["balance_eth"] > 0)
+
+    try:
+        # A slow public RPC must not block the event loop or hang the UI.
+        await asyncio.wait_for(asyncio.to_thread(probe), timeout=20)
+    except asyncio.TimeoutError:
+        out["note"] = "RPC probe timed out"
+    except Exception as exc:  # noqa: BLE001
+        out["note"] = scrub(f"{type(exc).__name__}: {str(exc)[:200]}")
+    return out
+
+
+@app.post("/api/v1/faces")
+async def detect_faces_endpoint(image: UploadFile = File(...)) -> dict:
+    """Detect faces in an upload and say whether we can pick one safely.
+
+    Staging the upload here and returning an `upload_id` means the operator's
+    photo crosses the wire once, not once per selection attempt, and the bytes
+    the scan runs on are byte-identical to the bytes the boxes were computed
+    from — so a box the operator clicked cannot refer to a different image.
+
+    Coordinates are in the pipeline's working image space (EXIF-oriented and
+    downscaled), and `image_width`/`image_height` are returned so a client can
+    map them onto whatever it is displaying.
+    """
+    data = await image.read()
+    _validate_upload(image, data)
+
+    _cleanup_jobs()
+    upload_id = f"upl_{uuid.uuid4().hex[:16]}"
+    suffix = Path(image.filename or "upload.jpg").suffix.lower() or ".jpg"
+    if suffix not in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".avif"):
+        suffix = ".jpg"
+    path = _upload_dir / f"{upload_id}{suffix}"
+    path.write_bytes(data)
+
+    def analyse() -> dict:
+        from facechain.evidence.hashing import sha256_bytes
+        from facechain.face import selection as face_selection
+        from facechain.face.encoder import read_image
+
+        img = read_image(path)
+        faces = face_selection.detect_faces(img)
+        offer = face_selection.offer(img, faces)
+        quality = face_selection.gate_selected(
+            img, faces, offer.auto_index if offer.auto_index is not None else None
+        )
+        return {
+            "upload_id": upload_id,
+            "sha256": sha256_bytes(data),
+            "image_width": int(img.shape[1]),
+            "image_height": int(img.shape[0]),
+            "faces": [f.model_dump(mode="json") for f in offer.faces],
+            "auto_index": offer.auto_index,
+            "selection_required": offer.selection_required,
+            "reason": offer.reason,
+            "quality": quality.rounded().model_dump(mode="json"),
+        }
+
+    try:
+        return await asyncio.to_thread(analyse)
+    except Exception as exc:  # noqa: BLE001
+        path.unlink(missing_ok=True)
+        log.exception("face detection failed")
+        raise HTTPException(422, f"could not analyse image: {type(exc).__name__}") from exc
+    finally:
+        if path.exists():
+            _uploads[upload_id] = (path, time.time())
 
 
 @app.post("/api/v1/scan")
 async def start_scan(
     background_tasks: BackgroundTasks,
-    image: UploadFile = File(...),
+    image: UploadFile | None = File(default=None),
+    upload_id: str = Form(default=""),
     engines: str = Form(default=""),
-    chain_mode: str = Form(default="skip"),
+    # What to do when attestation is *not* skipped. `no_chain` below is the
+    # gate, and it defaults to true, so the default behaviour is unchanged —
+    # but a caller that turns the gate off now gets a real transaction instead
+    # of silently falling back to "skip", which made on-chain attestation
+    # unreachable from the UI entirely.
+    chain_mode: str = Form(default="onchain"),
     max_verify: int = Form(default=0),
     user_declaration: str = Form(default="false"),
     no_chain: str = Form(default="true"),
+    face_index: str = Form(default=""),
+    crop: str = Form(default=""),
+    selection_mode: str = Form(default=""),
 ) -> dict:
+    """Start a scan from a fresh upload or from an upload already staged by
+    `POST /api/v1/faces`.
+
+    `face_index` and `crop` are optional. When neither is given and the image is
+    ambiguous, the pipeline stops with `FACE_SELECTION_REQUIRED` rather than
+    guessing which person the scan is about.
+    """
     _cleanup_jobs()
 
     _no_chain = no_chain.lower() in ("true", "1", "yes")
@@ -241,12 +427,27 @@ async def start_scan(
     if len(_jobs) >= settings.api_max_concurrent_scans * 4:
         raise HTTPException(429, "Too many pending jobs; try again shortly")
 
-    data = await image.read()
-    _validate_upload(image, data)
-
     case_id = f"case_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
-    img_path = _upload_dir / f"{case_id}{Path(image.filename or 'upload.jpg').suffix or '.jpg'}"
-    img_path.write_bytes(data)
+
+    if upload_id:
+        try:
+            safe_upload_id(upload_id)
+        except PathTraversalError:
+            raise HTTPException(400, "invalid upload_id") from None
+        staged = _uploads.get(upload_id)
+        if staged is None:
+            raise HTTPException(404, "upload_id not found or expired; upload the image again")
+        source, _ = staged
+        img_path = _upload_dir / f"{case_id}{source.suffix}"
+        img_path.write_bytes(source.read_bytes())
+    elif image is not None:
+        data = await image.read()
+        _validate_upload(image, data)
+        suffix = Path(image.filename or "upload.jpg").suffix or ".jpg"
+        img_path = _upload_dir / f"{case_id}{suffix}"
+        img_path.write_bytes(data)
+    else:
+        raise HTTPException(422, "provide either an image file or an upload_id")
 
     engine_list = [e.strip() for e in engines.split(",") if e.strip()] or None
     mode = "skip" if _no_chain else chain_mode
@@ -257,6 +458,9 @@ async def start_scan(
         chain_mode=mode,
         max_verify=max_verify or None,
         case_id=case_id,
+        face_index=_parse_face_index(face_index),
+        crop_rect=_parse_crop(crop),
+        selection_mode=selection_mode or None,
     )
     job = Job(case_id=case_id, image_path=img_path, opts=opts)
     if _user_decl:
@@ -277,11 +481,18 @@ async def _run_pipeline_background(case_id: str) -> None:
     job = _jobs.get(case_id)
     if not job:
         return
-    assert _SEMAPHORE is not None
-    async with _SEMAPHORE:
-        job.status = JobStatus.RUNNING
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, _run_pipeline_sync, job)
+    try:
+        assert _SEMAPHORE is not None
+        async with _SEMAPHORE:
+            job.status = JobStatus.RUNNING
+            await asyncio.to_thread(_run_pipeline_sync, job)
+    except Exception as exc:  # noqa: BLE001
+        # A failure in the scheduling layer itself (never mind the pipeline) must
+        # still terminate the job, or the SSE stream has nothing to close on.
+        log.exception("scan scheduling failed for %s", case_id)
+        job.status = JobStatus.FAILED
+        job.error = f"scheduling error: {type(exc).__name__}"
+        job.push("error", "fail", job.error)
 
 
 @app.get("/api/v1/scan/{case_id}/status")
@@ -312,7 +523,12 @@ async def scan_events(request: Request, case_id: str) -> EventSourceResponse:
         raise HTTPException(404, "case not found")
 
     async def generator():
+        # Every stream reaches a terminal event. A scan can end in success, in
+        # no-match, in insufficient evidence or in an unrecoverable error — but
+        # a client must never be left on "Scanning…" forever, so the deadline
+        # below turns even a wedged pipeline into a reported outcome.
         q = job.subscribe()
+        deadline = job.created_at + SCAN_DEADLINE_S
         try:
             while True:
                 if await request.is_disconnected():
@@ -324,6 +540,21 @@ async def scan_events(request: Request, case_id: str) -> EventSourceResponse:
                         break
                 except asyncio.TimeoutError:
                     if job.status in (JobStatus.DONE, JobStatus.FAILED):
+                        # The worker finished between our last read and now;
+                        # drain anything it queued, then close.
+                        while not q.empty():
+                            yield {"data": json.dumps(q.get_nowait())}
+                        if not any(e["stage"] in ("done", "error") for e in job.events):
+                            yield {"data": json.dumps({
+                                "stage": "done", "status": "ok",
+                                "detail": f"status={job.status}",
+                                "ts": datetime.now(timezone.utc).isoformat()})}
+                        break
+                    if time.time() > deadline:
+                        job.status = JobStatus.FAILED
+                        job.error = f"scan exceeded the {SCAN_DEADLINE_S}s deadline"
+                        job.push("error", "fail", job.error)
+                        yield {"data": json.dumps(job.events[-1])}
                         break
                     yield {"data": json.dumps({"stage": "ping", "status": "ok", "detail": ""})}
         finally:

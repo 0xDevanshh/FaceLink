@@ -5,6 +5,8 @@
 
 import type {
   CaseResult,
+  ChainStatusResponse,
+  FaceDetectResponse,
   HealthResponse,
   ScanStartResponse,
   ScanStatusResponse,
@@ -39,6 +41,22 @@ export class ApiError extends Error {
 export const api = {
   health(): Promise<HealthResponse> {
     return _fetch('/api/v1/health')
+  },
+
+  chainStatus(): Promise<ChainStatusResponse> {
+    return _fetch('/api/v1/chain/status')
+  },
+
+  /**
+   * Stage an upload and get back its detected faces.
+   *
+   * Returns an `upload_id` the scan reuses, so the photo crosses the wire once
+   * and the bytes scanned are the bytes the boxes were computed from.
+   */
+  detectFaces(file: File): Promise<FaceDetectResponse> {
+    const fd = new FormData()
+    fd.append('image', file)
+    return _fetch('/api/v1/faces', { method: 'POST', body: fd })
   },
 
   startScan(formData: FormData): Promise<ScanStartResponse> {

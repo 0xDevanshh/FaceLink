@@ -44,12 +44,40 @@ def test_strong_social_match_verifies():
     ]
 
 
-def test_non_social_never_verifies_however_good():
+def test_strong_non_social_match_verifies_on_face_evidence():
+    """Search priority must not become search exclusivity.
+
+    A face-verified match on a personal site, a university page or a conference
+    programme is real evidence. It used to be unverifiable purely because its
+    domain was absent from the platform table, which let a platform name stand
+    in for a measurement.
+    """
     vc = score_candidate(make(is_social=False, platform=None, domain="news.example.com",
+                              platform_priority=90,
                               image_similarity=1.0, face_similarity=1.0))
+    assert vc.verified
+    assert Stage.SOCIAL_MATCH not in vc.stages   # honest about where it came from
+    assert Stage.FACE_MATCH in vc.stages          # and about what was measured
+
+
+def test_non_social_with_weak_face_still_fails():
+    """Dropping the social requirement must not lower the face bar."""
+    vc = score_candidate(make(is_social=False, platform=None, domain="news.example.com",
+                              platform_priority=90,
+                              image_similarity=1.0, face_similarity=0.10,
+                              metadata_consistency=1.0))
     assert not vc.verified
-    assert Stage.SOCIAL_MATCH not in vc.stages
-    assert vc.final_score > settings.verify_min_score  # high score, still unverified
+    assert Stage.FACE_MATCH not in vc.stages
+
+
+def test_no_candidate_can_verify_without_a_face_match():
+    """The arithmetic, not a policy, is what blocks a non-matching face.
+
+    Face weight is 0.5, so image (0.4) plus metadata (0.1) top out at 0.5 —
+    below the 0.70 minimum. This asserts the weights still make that true.
+    """
+    ceiling = settings.weight_image + settings.weight_meta
+    assert ceiling < settings.verify_min_score
 
 
 def test_wrong_person_cannot_pass_on_image_similarity_alone():
@@ -116,24 +144,31 @@ def test_highest_stage_reached_is_union_in_ladder_order():
 
 # ---- failure explanation: must never state a falsehood --------------------
 
-def test_explain_failure_reports_missing_social_not_a_bogus_threshold():
-    """Regression: a 0.89-scoring non-social hit was reported as
-    'final score 0.891 < threshold 0.7', which is arithmetically false."""
-    good_but_not_social = score_candidate(
+def test_explain_failure_never_claims_a_threshold_failure_that_did_not_happen():
+    """Regression: a 0.89-scoring hit was reported as
+    'final score 0.891 < threshold 0.7', which is arithmetically false.
+
+    A candidate that cleared every gate cannot be cited as the reason nothing
+    verified, so it must not appear in the explanation at all.
+    """
+    verified = score_candidate(
         make(is_social=False, platform=None, domain="archived.example",
              image_similarity=1.0, face_similarity=0.93)
     )
-    reason = explain_failure([good_but_not_social])
-    assert "social" in reason.lower()
-    assert "< threshold" not in reason
+    assert verified.verified
+    assert explain_failure([verified]) == ""
 
 
-def test_explain_failure_describes_social_candidates_only():
-    social_weak = score_candidate(make(face_similarity=0.05, image_similarity=0.3))
-    nonsocial_strong = score_candidate(make(is_social=False, platform=None,
-                                            domain="x.example", face_similarity=0.99))
-    reason = explain_failure([social_weak, nonsocial_strong])
+def test_explain_failure_describes_the_best_unverified_candidate():
+    weak_social = score_candidate(make(face_similarity=0.05, image_similarity=0.3))
+    weaker_web = score_candidate(make(is_social=False, platform=None,
+                                      domain="x.example", face_similarity=0.01,
+                                      image_similarity=0.1))
+    reason = explain_failure([weak_social, weaker_web])
+    # The strongest *unverified* candidate is the social one, so it is the one
+    # named, and the stated similarity is really its own.
     assert "instagram.com" in reason
+    assert "0.050" in reason
 
 
 def test_explain_failure_on_empty():

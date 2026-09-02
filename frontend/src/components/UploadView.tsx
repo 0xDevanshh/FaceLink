@@ -1,5 +1,6 @@
-import React, { useCallback, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useRef, useState } from 'react'
 import { api, ApiError } from '../api/client'
+import type { ChainStatusResponse, FaceDetectResponse } from '../types/api'
 
 const MAX_MB = 10
 const MAX_BYTES = MAX_MB * 1024 * 1024
@@ -14,11 +15,22 @@ const ENGINES = [
   { id: 'serpapi_yandex', label: 'SerpAPI (Yandex)', apiKey: 'serpapi' },
 ]
 
-interface Props {
-  onScanStarted: (caseId: string) => void
+export interface ScanSettings {
+  engines: string[]
+  noChain: boolean
 }
 
-export default function UploadView({ onScanStarted }: Props) {
+interface Props {
+  onScanStarted: (caseId: string) => void
+  /**
+   * Called instead of starting a scan when the photo is ambiguous — several
+   * comparable faces, a marginal detection, a face too small to measure. The
+   * pipeline refuses to guess in those cases, so the operator chooses.
+   */
+  onSelectFace?: (file: File, detection: FaceDetectResponse, settings: ScanSettings) => void
+}
+
+export default function UploadView({ onScanStarted, onSelectFace }: Props) {
   const [file, setFile] = useState<File | null>(null)
   const [preview, setPreview] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -26,10 +38,22 @@ export default function UploadView({ onScanStarted }: Props) {
   const [selectedEngines, setSelectedEngines] = useState<Set<string>>(
     new Set(['yandex', 'bing', 'google_lens']),
   )
+  // Default to attesting when the backend reports a working attestation path.
+  // Blockchain anchoring is the product's point, so it should be opt-*out* on a
+  // configured install — but never silently on when it cannot actually work.
   const [noChain, setNoChain] = useState(true)
+  const [chain, setChain] = useState<ChainStatusResponse | null>(null)
   const [loading, setLoading] = useState(false)
   const [dragOver, setDragOver] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
+
+  useEffect(() => {
+    let live = true
+    api.chainStatus()
+      .then((s) => { if (live) { setChain(s); setNoChain(!s.ready) } })
+      .catch(() => { /* attestation stays off if we cannot confirm it works */ })
+    return () => { live = false }
+  }, [])
 
   const validate = (f: File): string | null => {
     if (f.size > MAX_BYTES) return `File too large (${(f.size / 1024 / 1024).toFixed(1)}MB — max ${MAX_MB}MB)`
@@ -76,11 +100,32 @@ export default function UploadView({ onScanStarted }: Props) {
     setLoading(true)
     setError(null)
     try {
+      // Detect first. An unambiguous photo goes straight through; anything else
+      // hands off to face selection rather than letting the pipeline guess.
+      const detection = await api.detectFaces(file)
+
+      if (detection.faces.length === 0) {
+        setError('No usable face detected. Please upload a clearer image, or one where the face is larger.')
+        setLoading(false)
+        return
+      }
+
+      if (detection.selection_required && onSelectFace) {
+        onSelectFace(file, detection, { engines: [...selectedEngines], noChain })
+        setLoading(false)
+        return
+      }
+
       const fd = new FormData()
-      fd.append('image', file)
+      fd.append('upload_id', detection.upload_id)
       fd.append('engines', [...selectedEngines].join(','))
       fd.append('no_chain', noChain ? 'true' : 'false')
+      fd.append('chain_mode', noChain ? 'skip' : 'onchain')
       fd.append('user_declaration', 'true')
+      if (detection.auto_index !== null) {
+        fd.append('face_index', String(detection.auto_index))
+        fd.append('selection_mode', 'auto')
+      }
       const res = await api.startScan(fd)
       onScanStarted(res.case_id)
     } catch (e) {
@@ -179,12 +224,38 @@ export default function UploadView({ onScanStarted }: Props) {
             type="checkbox"
             checked={noChain}
             onChange={(e) => setNoChain(e.target.checked)}
+            disabled={chain !== null && !chain.ready}
             className="accent-accent"
             aria-label="Skip blockchain attestation"
           />
           <span>Skip blockchain attestation (--no-chain)</span>
           <span className="text-muted text-xs ml-1">— no wallet or gas needed</span>
         </label>
+
+        {/* Say plainly whether attestation can actually happen. A greyed-out
+            option with no explanation is the same as a silent failure. */}
+        <p className="text-xs font-mono pl-6" data-testid="chain-readiness">
+          {chain === null ? (
+            <span className="text-muted">Checking attestation configuration…</span>
+          ) : chain.ready ? (
+            <span className="text-success">
+              ⛓ {chain.network_name} (chain {chain.chain_id}) ready — schema registered, attester funded
+              {chain.balance_eth !== null && ` (${chain.balance_eth} ETH)`}
+            </span>
+          ) : (
+            <span className="text-warn">
+              ⚠ On-chain attestation unavailable:{' '}
+              {!chain.signer_configured
+                ? 'no attester key configured'
+                : !chain.rpc_reachable
+                  ? `cannot reach ${chain.network_name}`
+                  : !chain.schema_registered
+                    ? 'EAS schema is not registered on this network'
+                    : 'attester has no balance'}
+              . The scan still runs and evidence is still generated and hashed.
+            </span>
+          )}
+        </p>
       </section>
 
       {/* Authorization declaration */}

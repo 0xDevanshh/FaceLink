@@ -19,8 +19,15 @@ import re
 from dataclasses import dataclass, field
 from urllib.parse import parse_qs, parse_qsl, unquote, urlencode, urlparse, urlsplit, urlunsplit
 
-from ..config import SOCIAL_DOMAINS, settings
-from ..models import SearchCandidate
+from ..config import (
+    GITHUB_MEDIA_HOSTS,
+    OTHER_WEB_PRIORITY,
+    PLATFORM_MEDIA_DOMAINS,
+    SOCIAL_DOMAINS,
+    platform_priority,
+    settings,
+)
+from ..models import CandidateType, ProviderStatus, SearchCandidate
 
 log = logging.getLogger(__name__)
 
@@ -50,25 +57,125 @@ class EngineResult:
     ok: bool = True
     error: str = ""
     query_mode: str = ""  # "upload" | "by-url" | "api"
+    # Set by an adapter that knows precisely what happened (a detected CAPTCHA,
+    # a missing API key). Left None when only the error text is available, in
+    # which case the orchestrator classifies it.
+    status: ProviderStatus | None = None
 
 
 def normalise_domain(url: str) -> str:
+    """Lowercased hostname with a leading `www.` removed, in punycode.
+
+    Non-ASCII hosts are IDNA-encoded before anything compares them, so a
+    homoglyph domain (Cyrillic 'а' in "аpple.com") becomes its `xn--` form and
+    cannot collide with the ASCII platform names in the table below. A host we
+    cannot encode is treated as having no domain, i.e. unrecognised.
+    """
     try:
         host = (urlparse(url).hostname or "").lower()
     except ValueError:
         return ""
+    if not host:
+        return ""
+    if not host.isascii():
+        try:
+            host = host.encode("idna").decode("ascii").lower()
+        except (UnicodeError, UnicodeDecodeError):
+            return ""
     return host[4:] if host.startswith("www.") else host
 
 
-def classify_social(url: str) -> tuple[bool, str | None]:
-    """Is this URL a social-media post, and on which platform?"""
+def host_matches(host: str, domain: str) -> bool:
+    """Exact host, or a genuine subdomain of it.
+
+    The `.`-anchored suffix test is what stops `linkedin.com.attacker.com` and
+    `notlinkedin.com` from being read as LinkedIn.
+    """
+    return bool(host) and (host == domain or host.endswith("." + domain))
+
+
+def classify_platform(url: str) -> tuple[bool, str | None, int]:
+    """`(recognised, platform_name, discovery_priority)` for a URL.
+
+    Recognition is hostname-exact. Priority orders *what we look at first*; it
+    never contributes to whether a candidate verifies.
+    """
     host = normalise_domain(url)
     if not host:
-        return False, None
+        return False, None, OTHER_WEB_PRIORITY
     for domain, platform in SOCIAL_DOMAINS.items():
-        if host == domain or host.endswith("." + domain):
-            return True, platform
-    return False, None
+        if host_matches(host, domain):
+            return True, platform, platform_priority(platform)
+    # A platform's media CDN is still that platform. Checked second so a site
+    # domain always wins, and matched with the same `.`-anchored rule so a
+    # lookalike CDN name cannot borrow the attribution.
+    for domain, platform in PLATFORM_MEDIA_DOMAINS.items():
+        if host_matches(host, domain):
+            return True, platform, platform_priority(platform)
+    return False, None, OTHER_WEB_PRIORITY
+
+
+def classify_social(url: str) -> tuple[bool, str | None]:
+    """Is this URL on a platform we can name, and which one?
+
+    Retained as the search layer's public helper; `classify_platform` adds the
+    discovery priority for callers that rank.
+    """
+    recognised, platform, _ = classify_platform(url)
+    return recognised, platform
+
+
+def is_github_media(url: str) -> bool:
+    """A GitHub host that serves image bytes rather than an HTML page."""
+    host = normalise_domain(url)
+    return any(host_matches(host, h) for h in GITHUB_MEDIA_HOSTS)
+
+
+# Path shapes that mark an article rather than a generic page.
+_ARTICLE_MARKERS = ("/blog/", "/news/", "/article/", "/articles/", "/story/",
+                    "/press/", "/post/", "/posts/", "/pulse/")
+
+# Profile paths that the generic "two or more path segments means a post"
+# heuristic in `looks_like_post` gets wrong: `linkedin.com/in/someone` is a
+# person's profile, not a post, and counting slashes cannot tell the difference.
+_PROFILE_PATH_MARKERS = ("/in/", "/company/", "/school/", "/user/", "/users/",
+                         "/channel/", "/profile/", "/people/", "/author/")
+
+
+def initial_candidate_type(url: str, platform: str | None) -> CandidateType:
+    """Type a candidate from its URL alone, before we have measured anything.
+
+    This is a provisional label for ranking and display. Once the image has
+    actually been fetched and compared, `scorer.score_candidate` upgrades it to
+    EXACT_IMAGE / SAME_FACE, which are claims about measurements rather than
+    about URL shape.
+    """
+    lowered = url.lower()
+    if platform == "GitHub":
+        # A raw avatar file is still evidence about a developer identity.
+        return CandidateType.DEVELOPER_PROFILE
+    if platform:
+        # An explicit profile path beats the slash-counting heuristic.
+        if any(m in lowered for m in _PROFILE_PATH_MARKERS):
+            return CandidateType.SOCIAL_PROFILE
+        return CandidateType.SOCIAL_POST if looks_like_post(url) else CandidateType.SOCIAL_PROFILE
+    if any(m in lowered for m in _ARTICLE_MARKERS):
+        return CandidateType.PUBLIC_ARTICLE
+    return CandidateType.PUBLIC_WEB_PAGE
+
+
+def classify_block(reason: str) -> ProviderStatus:
+    """Map a detected interstitial to a provider status.
+
+    Rate limiting and bot challenges are both refusals, but they are different
+    facts: one clears on its own, the other needs a human. Reporting them
+    separately is the difference between "retry later" and "this provider is
+    unavailable to automation right now".
+    """
+    lowered = reason.lower()
+    if "rate limit" in lowered or "too many requests" in lowered:
+        return ProviderStatus.RATE_LIMITED
+    return ProviderStatus.CHALLENGED
 
 
 def is_junk(url: str) -> bool:
@@ -151,7 +258,7 @@ def build_candidates(engine: str, raw: list[dict], limit: int | None = None) -> 
             continue
         seen.add(key)
 
-        is_social, platform = classify_social(href)
+        is_social, platform, priority = classify_platform(href)
         out.append(
             SearchCandidate(
                 engine=engine,
@@ -161,12 +268,16 @@ def build_candidates(engine: str, raw: list[dict], limit: int | None = None) -> 
                 thumbnail=(row.get("thumb") or "")[:500],
                 is_social=is_social,
                 platform=platform,
+                platform_priority=priority,
+                candidate_type=initial_candidate_type(href, platform),
             )
         )
 
-    # Social posts first, then social profiles, then everything else —
-    # the task asks specifically for a social media post.
-    out.sort(key=lambda c: (not c.is_social, not looks_like_post(c.url)))
+    # Priority platforms first (LinkedIn → Instagram → X → GitHub → YouTube →
+    # other recognised → wider web), and within a platform a specific post
+    # ahead of a bare profile. This orders which leads get fetch budget; it does
+    # not decide which of them verify.
+    out.sort(key=lambda c: (c.platform_priority, not looks_like_post(c.url)))
     return out[:limit]
 
 
@@ -199,7 +310,7 @@ def collect_results(
 
     blocked = detect_block(page)
     if blocked:
-        return EngineResult(engine, ok=False, error=blocked)
+        return EngineResult(engine, ok=False, error=blocked, status=classify_block(blocked))
 
     def body_text() -> str:
         try:
@@ -234,8 +345,11 @@ def collect_results(
     rows = SearchEngineAdapter.harvest_anchors(page, containers)
     candidates = build_candidates(engine, rows, limit)
     if not candidates:
-        return EngineResult(engine, ok=False, error="no outbound result links found")
-    return EngineResult(engine, candidates=candidates)
+        # We reached the results view (the marker proved it) and it held nothing
+        # we could use. That is an empty search, not a broken provider.
+        return EngineResult(engine, ok=False, error="no outbound result links found",
+                            status=ProviderStatus.NO_RESULTS)
+    return EngineResult(engine, candidates=candidates, status=ProviderStatus.COMPLETED)
 
 
 class SearchEngineAdapter:

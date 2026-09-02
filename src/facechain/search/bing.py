@@ -21,7 +21,18 @@ BY_URL = (
     "&q=imgurl:{url}&mediaurl={url}"
 )
 
-FILE_INPUTS = ("input#sb_fileinput", "input[type=file]")
+FILE_INPUTS = ("input#sb_fileinput", "input[type=file].fileinput", "input[type=file]")
+# `#sb_sbi` ("Search using an image") opens the visual-search pane. Bing binds
+# the change handler for `#sb_fileinput` when that pane opens, so setting the
+# file *before* clicking it attaches the image to an input nobody is listening
+# to: the page stays on the images homepage and a whole-page link harvest would
+# return trending-topic links. Hence PANE_TRIGGERS, applied first, not as a
+# fallback.
+PANE_TRIGGERS = (
+    "#sb_sbi",
+    "[aria-label='Search using an image']",
+    "#sbi_b",
+)
 UPLOAD_TRIGGERS = (
     "div#sbiarea_camera",
     "div.camera",
@@ -33,6 +44,25 @@ RESULT_CONTAINERS = (".b_cit_row", ".cit_cards", "#insights_results", ".insights
 MARKERS = ("pages with this image", "pages including this image", "visual matches",
            "related searches", "image results")
 VIEW_LABELS = (r"pages with this image", r"pages including")
+
+
+def _open_visual_search_pane(page) -> bool:
+    """Click Bing's camera affordance so the file input becomes live.
+
+    Best-effort: if none of the triggers are present the adapter still tries the
+    plain input, and the marker guard in `collect_results` catches the case where
+    that silently fails to submit.
+    """
+    for sel in PANE_TRIGGERS:
+        try:
+            el = page.query_selector(sel)
+            if el:
+                el.click(timeout=3000)
+                settle(page, 1200)
+                return True
+        except Exception as exc:  # noqa: BLE001
+            log.debug("bing pane trigger %s failed: %s", sel, exc)
+    return False
 
 
 class BingVisualAdapter(SearchEngineAdapter):
@@ -52,10 +82,11 @@ class BingVisualAdapter(SearchEngineAdapter):
                 else:
                     page.goto(HOME, wait_until="domcontentloaded")
                     settle(page, 1200)
+                    _open_visual_search_pane(page)
                     if not attach_file(page, image_path, FILE_INPUTS, UPLOAD_TRIGGERS):
                         return EngineResult(self.name, ok=False, query_mode=mode,
                                             error="could not attach file to Bing visual search")
-                settle(page, 3500)
+                settle(page, 4500)
 
                 result = collect_results(
                     page,

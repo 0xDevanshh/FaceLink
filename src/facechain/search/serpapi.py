@@ -18,6 +18,7 @@ import urllib.parse
 import urllib.request
 
 from ..config import settings
+from ..models import ProviderStatus
 from .base import EngineResult, SearchEngineAdapter, build_candidates
 
 log = logging.getLogger(__name__)
@@ -25,12 +26,18 @@ log = logging.getLogger(__name__)
 ENDPOINT = "https://serpapi.com/search.json"
 
 # SerpAPI result sections that contain page URLs, in order of usefulness.
+# Listed generously on purpose: SerpAPI renames and reshuffles these as the
+# upstream engines change, and a section we do not read is a real result
+# silently discarded.
 SECTIONS = (
     "image_results",
     "visual_matches",
     "exact_matches",
     "pages_with_matching_images",
+    "related_content",
+    "knowledge_graph",
     "inline_images",
+    "image_sources",
     "organic_results",
 )
 
@@ -47,16 +54,22 @@ class SerpApiAdapter(SearchEngineAdapter):
 
     def search(self, image_path: str, image_url: str | None = None) -> EngineResult:
         if not settings.serpapi_key:
-            return EngineResult(self.name, ok=False, query_mode="api", error="SERPAPI_KEY not set")
+            return EngineResult(self.name, ok=False, query_mode="api",
+                                status=ProviderStatus.NOT_CONFIGURED,
+                                error="SERPAPI_KEY not set")
         if not image_url:
             return EngineResult(
                 self.name, ok=False, query_mode="api",
+                status=ProviderStatus.NOT_CONFIGURED,
                 error="SerpAPI needs a public image URL (use --image-url or --allow-upload-host)",
             )
 
+        # Deliberately unrestricted. Pinning `type=exact_matches` made Lens
+        # return "hasn't returned any results" for images that do have visual
+        # matches, so the narrower query was costing real candidates. Exact
+        # versus same-face is decided here anyway — by measuring the image —
+        # not by asking the provider to pre-filter.
         params = {"engine": self.serp_engine, "api_key": settings.serpapi_key, "url": image_url}
-        if self.serp_engine == "google_lens":
-            params["type"] = "exact_matches"
         query = f"{ENDPOINT}?{urllib.parse.urlencode(params)}"
 
         try:
@@ -87,5 +100,7 @@ class SerpApiAdapter(SearchEngineAdapter):
         cands = build_candidates(self.name, rows)
         if not cands:
             return EngineResult(self.name, ok=False, query_mode="api",
+                                status=ProviderStatus.NO_RESULTS,
                                 error="API returned no usable page links")
-        return EngineResult(self.name, candidates=cands, query_mode="api")
+        return EngineResult(self.name, candidates=cands, query_mode="api",
+                            status=ProviderStatus.COMPLETED)

@@ -180,6 +180,13 @@ def detect_block(page) -> str:
         "verify you are human": "human verification required",
         "access denied": "access denied",
         "too many requests": "rate limited",
+        # Bing's soft refusal for automated visual search. It looks like a bad
+        # image ("try a different image") but it fires for every image and every
+        # size, so it is a refusal to serve, not a complaint about the input.
+        # Reporting it as CHALLENGED is the accurate description; it is not
+        # something to work around.
+        "unable to process this search": "engine refused to process the image "
+                                        "(automated-request block)",
     }
     for needle, reason in signals.items():
         if needle in body:

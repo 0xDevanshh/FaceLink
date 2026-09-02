@@ -29,6 +29,13 @@ const MOCK_RESULT: CaseResult = {
     detected: true, backend: 'insightface', model: 'buffalo_l/SCRFD+ArcFace',
     faces_found: 1, bbox: [10, 20, 110, 140], det_score: 0.89,
     embedding_dimension: 512, embedding_sha256: 'bb'.repeat(32),
+    faces: [], quality: null,
+  },
+  face_selection: {
+    mode: 'auto', face_index: 0, faces_offered: 1, bbox: [10, 20, 110, 140],
+    crop_rect: null, crop_sha256: null,
+    original_sha256: 'cc'.repeat(32), original_width: 800, original_height: 1200,
+    selected_at: '2026-09-01T00:00:00Z',
   },
   reverse_search: {
     engines_attempted: ['yandex', 'bing'],
@@ -37,6 +44,11 @@ const MOCK_RESULT: CaseResult = {
     query_mode: { yandex: 'upload' },
     total_candidates: 10,
     social_candidates: 2,
+    providers: [
+      { engine: 'yandex', status: 'COMPLETED', candidates: 5, duration_s: 12.5, query_mode: 'upload', error: '' },
+    ],
+    platform_counts: { LinkedIn: 0, Instagram: 2, 'X/Twitter': 0, GitHub: 0, YouTube: 0, 'Other Web': 3 },
+    timed_out: false,
   },
   verification: [],
   best_match: null,
