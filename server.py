@@ -411,6 +411,7 @@ async def start_scan(
     face_index: str = Form(default=""),
     crop: str = Form(default=""),
     selection_mode: str = Form(default=""),
+    scan_depth: str = Form(default="standard"),
 ) -> dict:
     """Start a scan from a fresh upload or from an upload already staged by
     `POST /api/v1/faces`.
@@ -461,6 +462,7 @@ async def start_scan(
         face_index=_parse_face_index(face_index),
         crop_rect=_parse_crop(crop),
         selection_mode=selection_mode or None,
+        scan_depth=scan_depth if scan_depth in ("fast", "standard", "deep") else "standard",
     )
     job = Job(case_id=case_id, image_path=img_path, opts=opts)
     if _user_decl:

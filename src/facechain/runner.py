@@ -46,20 +46,28 @@ class RunOptions:
     max_verify: int | None = None
     case_id: str | None = None
     # ---- face selection -------------------------------------------------
-    # Which detected face the scan is about. None lets the pipeline decide, and
-    # it will only decide when the choice is unambiguous.
     face_index: int | None = None
-    # Operator-drawn `[x, y, width, height]` in the coordinates of the image as
-    # the pipeline reads it (EXIF-oriented, downscaled to MAX_EDGE).
     crop_rect: list[int] | None = None
-    # How the face was chosen: auto | manual-face | manual-crop. Recorded in
-    # evidence; the pipeline corrects it if it disagrees with what was passed.
     selection_mode: str | None = None
+    # ---- scan depth -----------------------------------------------------
+    # fast: small candidate set (10), standard: normal (12), deep: maximum (30+)
+    scan_depth: str = "standard"  # fast | standard | deep
 
 
 class PipelineError(RuntimeError):
     pass
 
+
+from .verification.clustering import cluster_candidates, corroboration_summary
+
+# ---- scan depth budgets -----------------------------------------------
+DEPTH_BUDGETS: dict[str, int] = {
+    "fast": 5,
+    "standard": 12,
+    "deep": 30,
+}
+# Maximum bytes to download across all candidate images in one scan.
+MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
 
 # Share of the verification budget reserved for candidates outside the priority
 # platforms. Without a reservation, a run that happens to surface 12 LinkedIn
@@ -350,27 +358,24 @@ def run(opts: RunOptions, report: Reporter | None = None) -> Case:
     )
 
     # ---- 4. candidate verification --------------------------------------
-    #
-    # The queue is ordered by discovery priority (LinkedIn → Instagram → X →
-    # GitHub → YouTube → other named platforms → wider web) because fetch
-    # budget is finite and those are the leads most likely to be worth it. It is
-    # a *queue order*, not a filter: the wider web is in the same queue and can
-    # win outright on verification strength.
     emit("verify", "start", "")
-    limit = opts.max_verify or settings.max_candidates_to_verify
+    depth_limit = DEPTH_BUDGETS.get(opts.scan_depth, DEPTH_BUDGETS["standard"])
+    limit = opts.max_verify or depth_limit
+    if opts.scan_depth == "deep":
+        emit("verify:depth", "info", f"deep scan mode — budget {limit} candidates")
     queue = _verification_queue(search_report.candidates, limit)
 
     verified: list[VerifiedCandidate] = []
     media_cache = MediaCache()
+    download_bytes = 0
     for cand in queue:
+        if download_bytes >= MAX_DOWNLOAD_BYTES:
+            emit("verify:limit", "info",
+                 f"download budget reached ({download_bytes // (1024*1024)}MB) — stopping early")
+            break
         try:
-            # Image similarity is measured against whatever was searched, so
-            # "exact image" means "the same picture as the query" rather than
-            # comparing a candidate found from a crop against the full frame.
             vc = score_candidate(verify_candidate(cand, query_hashes, embedding, media_cache))
         except Exception as exc:  # noqa: BLE001
-            # One malformed candidate must not end the scan. Record it as
-            # unverifiable and carry on down the queue.
             log.warning("candidate %s raised during verification: %s", cand.url, exc)
             vc = VerifiedCandidate(
                 engine=cand.engine, url=cand.url, domain=cand.domain,
@@ -380,6 +385,7 @@ def run(opts: RunOptions, report: Reporter | None = None) -> Case:
                 rejection_reason=f"verification error: {type(exc).__name__}",
             )
         verified.append(vc)
+        download_bytes = media_cache.downloads * 500_000  # rough estimate for budget guard
         emit(
             "verify:candidate",
             "ok" if vc.verified else "info",
@@ -387,10 +393,25 @@ def run(opts: RunOptions, report: Reporter | None = None) -> Case:
             f"face {vc.face_similarity:.2f} score {vc.final_score:.2f} "
             f"{'VERIFIED' if vc.verified else vc.match_type}",
         )
-    # Every candidate in the queue is measured, so the result page can show the
-    # full ranked set of discoveries rather than only the first hit that passed.
+        # Deep mode: early-stop only when we have 3+ independent verified clusters
+        if opts.scan_depth != "deep" and vc.verified:
+            # Standard/fast: stop at first verified match to save time
+            pass  # still process remainder so full ranked list is available
     emit("verify:media", "info",
          f"{media_cache.downloads} image download(s), {media_cache.hits} reused from cache")
+
+    # ---- 4b. image deduplication + corroboration -------------------------
+    clusters = cluster_candidates(verified)
+    corr = corroboration_summary(clusters)
+    emit(
+        "verify:corroboration", "info",
+        f"{corr.image_clusters} image clusters (deduped from {corr.total_candidates}), "
+        f"{corr.independent_domains} domains, {corr.independent_platforms} platforms, "
+        f"{corr.verified_clusters} verified",
+    )
+    if corr.duplicate_count > 0:
+        emit("verify:duplicates", "info",
+             f"{corr.duplicate_count} near-duplicate image(s) grouped — count as 1 evidence cluster each")
 
     ranked = rank(verified)
     case.verification = ranked

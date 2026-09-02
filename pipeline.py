@@ -157,6 +157,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--face-backend", choices=["auto", "insightface", "opencv"], default=None)
     p.add_argument("--max-verify", type=int, default=None,
                    help="max candidates to fetch and measure")
+    p.add_argument("--scan-depth", choices=["fast", "standard", "deep"], default="standard",
+                   help="fast: 5 candidates, standard: 12, deep: 30 with max discovery")
     p.add_argument("--case-id", default=None, help="override the generated case id")
 
     chain = p.add_mutually_exclusive_group()
@@ -195,6 +197,7 @@ def main(argv: list[str] | None = None) -> int:
         face_backend=args.face_backend,
         max_verify=args.max_verify,
         case_id=args.case_id,
+        scan_depth=args.scan_depth,
     )
 
     header()

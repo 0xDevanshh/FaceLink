@@ -42,6 +42,7 @@ export default function UploadView({ onScanStarted, onSelectFace }: Props) {
   // Blockchain anchoring is the product's point, so it should be opt-*out* on a
   // configured install — but never silently on when it cannot actually work.
   const [noChain, setNoChain] = useState(true)
+  const [scanDepth, setScanDepth] = useState<'fast' | 'standard' | 'deep'>('standard')
   const [chain, setChain] = useState<ChainStatusResponse | null>(null)
   const [loading, setLoading] = useState(false)
   const [dragOver, setDragOver] = useState(false)
@@ -122,6 +123,7 @@ export default function UploadView({ onScanStarted, onSelectFace }: Props) {
       fd.append('no_chain', noChain ? 'true' : 'false')
       fd.append('chain_mode', noChain ? 'skip' : 'onchain')
       fd.append('user_declaration', 'true')
+      fd.append('scan_depth', scanDepth)
       if (detection.auto_index !== null) {
         fd.append('face_index', String(detection.auto_index))
         fd.append('selection_mode', 'auto')
@@ -231,6 +233,28 @@ export default function UploadView({ onScanStarted, onSelectFace }: Props) {
           <span>Skip blockchain attestation (--no-chain)</span>
           <span className="text-muted text-xs ml-1">— no wallet or gas needed</span>
         </label>
+
+        {/* Scan depth */}
+        <div className="flex items-center gap-3 text-sm" role="group" aria-label="Scan depth">
+          <span className="text-muted shrink-0">Scan depth</span>
+          {(['fast', 'standard', 'deep'] as const).map((d) => (
+            <label key={d} className={`flex items-center gap-1 cursor-pointer px-2 py-1 rounded border text-xs
+              ${scanDepth === d ? 'border-accent/60 bg-surface-2 text-accent' : 'border-border text-muted'}`}>
+              <input
+                type="radio"
+                name="scan_depth"
+                value={d}
+                checked={scanDepth === d}
+                onChange={() => setScanDepth(d)}
+                className="sr-only"
+              />
+              {d}
+            </label>
+          ))}
+          <span className="text-muted text-xs">
+            {scanDepth === 'fast' ? '5 candidates' : scanDepth === 'deep' ? '30 candidates · slower' : '12 candidates'}
+          </span>
+        </div>
 
         {/* Say plainly whether attestation can actually happen. A greyed-out
             option with no explanation is the same as a silent failure. */}
