@@ -28,12 +28,14 @@ def test_enabling_the_gate_allows_a_real_upload_attempt(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "allow_upload_host", True)
 
     def fake_transport(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, text="https://litter.catbox.moe/abc123.jpg")
+        if request.method == "POST":
+            return httpx.Response(200, text="https://litter.catbox.moe/abc123.jpg")
+        # The post-publish remote validation HEAD/GET.
+        return httpx.Response(200, headers={"content-type": "image/jpeg"})
 
-    monkeypatch.setattr(
-        httpx, "post",
-        lambda url, **kw: httpx.Client(transport=httpx.MockTransport(fake_transport)).post(url, **kw),
-    )
+    mock_client = httpx.Client(transport=httpx.MockTransport(fake_transport))
+    monkeypatch.setattr(httpx, "post", lambda url, **kw: mock_client.post(url, **kw))
+    monkeypatch.setattr(httpx, "head", lambda url, **kw: mock_client.head(url, **kw))
 
     img = tmp_path / "photo.jpg"
     img.write_bytes(b"fake-jpeg-bytes")

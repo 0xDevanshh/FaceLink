@@ -119,8 +119,22 @@ def _run_browser_engine(name: str, image_path: str, public_url: str | None) -> E
         return res
 
 
-def _run_api_engine(name: str, image_path: str, public_url: str | None) -> EngineResult:
-    res = API_ADAPTERS[name]().search(image_path, public_url)
+def _run_api_engine(
+    name: str, image_path: str, public_url: str | None, upload_failure: str | None = None,
+) -> EngineResult:
+    adapter = API_ADAPTERS[name]()
+    if public_url is None and upload_failure and adapter.requires_public_url:
+        # This adapter has no way to run without a public URL, and one was
+        # genuinely attempted and failed — not simply never requested. Report
+        # the real cause rather than calling `.search()`, which can only ever
+        # produce its generic "needs a public image URL" message here and
+        # would misleadingly suggest the fix is to enable a flag that is
+        # already enabled.
+        return EngineResult(
+            name, ok=False, query_mode="api", status=ProviderStatus.FAILED,
+            error=f"temporary image publication failed: {upload_failure}",
+        )
+    res = adapter.search(image_path, public_url)
     # `SerpApiAdapter.name` is derived from its own `serp_engine` id (e.g.
     # "serpapi_yandex_images"), which does not always match the registry key
     # a caller actually requested (e.g. "serpapi_yandex"). Normalising here
@@ -130,6 +144,22 @@ def _run_api_engine(name: str, image_path: str, public_url: str | None) -> Engin
     return res
 
 
+def _requires_public_url(name: str) -> bool:
+    if name in BROWSER_ADAPTERS:
+        return bool(getattr(BROWSER_ADAPTERS[name], "requires_public_url", False))
+    if name in API_ADAPTERS:
+        return bool(getattr(API_ADAPTERS[name](), "requires_public_url", False))
+    return False
+
+
+def _has_reliable_upload_alternative(name: str) -> bool:
+    if name in BROWSER_ADAPTERS:
+        return bool(getattr(BROWSER_ADAPTERS[name], "has_reliable_upload_alternative", False))
+    if name in API_ADAPTERS:
+        return bool(getattr(API_ADAPTERS[name](), "has_reliable_upload_alternative", False))
+    return False
+
+
 def _run_engine_pass(
     image_path: str,
     engines: list[str],
@@ -137,12 +167,18 @@ def _run_engine_pass(
     stage_deadline: float,
     emit: Callable[[str, str, str], None],
     emit_prefix: str = "",
+    upload_failure: str | None = None,
 ) -> tuple[list[EngineResult], list[ProviderReport], bool]:
     """Fan `image_path` out across `engines` once, bounded by `stage_deadline`.
 
     Shared by the primary (original-image) pass and every extra search-variant
     pass, so a variant gets the exact same isolation/timeout/concurrency
     guarantees as the main search rather than a cheaper approximation of them.
+
+    `upload_failure`, when set, is the reason a central public-URL publish was
+    attempted and failed this run — passed through so an adapter that
+    genuinely cannot run without one reports that real cause instead of a
+    generic "not configured" message.
     """
 
     def tag(engine: str) -> str:
@@ -154,7 +190,8 @@ def _run_engine_pass(
         if name in BROWSER_ADAPTERS:
             planned.append((name, lambda n=name: _run_browser_engine(n, image_path, public_url)))
         elif name in API_ADAPTERS:
-            planned.append((name, lambda n=name: _run_api_engine(n, image_path, public_url)))
+            planned.append((name, lambda n=name: _run_api_engine(
+                n, image_path, public_url, upload_failure)))
         else:
             providers.append(ProviderReport(
                 engine=name, status=ProviderStatus.FAILED, error="unknown engine"))
@@ -296,13 +333,25 @@ def run_reverse_search(
     # If a public URL is available (given, or opted-in temp upload), engines can
     # use their much more reliable by-URL endpoints.
     public_url = image_url
+    upload_failure: str | None = None
     if public_url is None and settings.allow_upload_host:
-        try:
-            public_url = publish_temporarily(image_path)
-            emit("host", "ok", public_url)
-        except UploadError as exc:
-            log.warning("temp hosting failed, falling back to upload flows: %s", exc)
-            emit("host", "fail", str(exc))
+        # Lazy publication: only spend a real upload attempt when at least one
+        # selected engine would actually benefit. An engine with its own
+        # equally reliable first-party upload path (e.g. SerpAPI's Google
+        # Lens image_id flow) gains nothing from central hosting; a browser
+        # adapter's in-page upload flow is measurably more fragile than
+        # by-URL, so it still counts as benefiting.
+        if any(not _has_reliable_upload_alternative(name) for name in engines):
+            try:
+                public_url = publish_temporarily(image_path)
+                emit("host", "ok", public_url)
+            except UploadError as exc:
+                upload_failure = str(exc)
+                log.warning("temp hosting failed, falling back to upload flows: %s", exc)
+                emit("host", "fail", str(exc))
+        else:
+            emit("host", "skip",
+                 "no selected engine needs central hosting (each has its own reliable path)")
 
     extra_variants = [v for v in (variants or []) if v.image_path != image_path]
     n_passes = 1 + len(extra_variants)
@@ -316,7 +365,8 @@ def run_reverse_search(
     # ---- primary pass: the image already chosen upstream (crop or upload) ---
     primary_deadline = now + per_pass_budget
     results, providers, timed_out = _run_engine_pass(
-        image_path, engines, public_url, primary_deadline, emit
+        image_path, engines, public_url, primary_deadline, emit,
+        upload_failure=upload_failure,
     )
     report.providers = providers
     report.timed_out = timed_out
@@ -346,6 +396,7 @@ def run_reverse_search(
         v_results, _v_providers, v_timed_out = _run_engine_pass(
             variant.image_path, engines, public_url, pass_deadline, emit,
             emit_prefix=f"variant:{variant.variant_type}:",
+            upload_failure=upload_failure,
         )
         report.timed_out = report.timed_out or v_timed_out
         before = len(merged)

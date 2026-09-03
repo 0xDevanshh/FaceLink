@@ -33,7 +33,7 @@ def stub_adapters(monkeypatch):
     """Replace the adapter registries with callables we control."""
     behaviours: dict[str, callable] = {}
 
-    def runner(name, image_path, public_url):
+    def runner(name, image_path, public_url, upload_failure=None):
         return behaviours[name]()
 
     monkeypatch.setattr(orchestrator, "BROWSER_ADAPTERS", {})
@@ -272,7 +272,7 @@ def path_aware_adapters(monkeypatch):
     *different* image rather than repeating the original's query."""
     behaviours: dict[str, callable] = {}
 
-    def runner(name, image_path, public_url):
+    def runner(name, image_path, public_url, upload_failure=None):
         return behaviours[name](image_path)
 
     monkeypatch.setattr(orchestrator, "BROWSER_ADAPTERS", {})

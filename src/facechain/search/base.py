@@ -358,6 +358,21 @@ class SearchEngineAdapter:
     name = "abstract"
     supports_upload = True
     supports_by_url = False
+    # True only for an adapter that has no way to search a local file at all —
+    # it can only ever run given a public URL, so the orchestrator knows a
+    # temporary-hosting attempt is genuinely necessary (not just helpful) for
+    # this adapter, and its failure state should be reported as a real failure
+    # rather than a generic "not configured".
+    requires_public_url = False
+    # True only when an adapter's own local-upload path is *just as reliable*
+    # as a centrally hosted public URL — e.g. a first-party API upload
+    # endpoint, as opposed to a browser adapter's in-page upload flow, which a
+    # public URL measurably rescues from bot-detection/selector fragility.
+    # Lets the orchestrator skip a central hosting attempt only when nothing
+    # selected would actually benefit from one, rather than skipping whenever
+    # nothing strictly *requires* one (which browser adapters never do, yet
+    # clearly benefit from).
+    has_reliable_upload_alternative = False
 
     def search(self, image_path: str, image_url: str | None = None) -> EngineResult:
         raise NotImplementedError
