@@ -225,6 +225,41 @@ def test_recognised_but_unprioritised_platform_counts_as_other_web():
     assert counts["LinkedIn"] == 0
 
 
+# ---- API adapter name normalisation ---------------------------------------
+
+def test_api_engine_result_is_reported_under_the_requested_registry_key(monkeypatch):
+    """Regression: `SerpApiAdapter("yandex_images").name` is
+    "serpapi_yandex_images", which does not match the registry key
+    "serpapi_yandex" a caller actually requests. `report.providers` must show
+    the name that was requested (and emitted live), not whatever the adapter
+    happens to call itself internally."""
+
+    class FakeAdapter:
+        def search(self, image_path, public_url):
+            # Simulates an adapter reporting a self-derived name that differs
+            # from the registry key it was constructed under.
+            return EngineResult("some_other_internal_name",
+                                candidates=[], ok=False,
+                                status=ProviderStatus.NO_RESULTS)
+
+    monkeypatch.setattr(orchestrator, "API_ADAPTERS", {"serpapi_yandex": lambda: FakeAdapter()})
+    report, _ = run_reverse_search("x.jpg", engines=["serpapi_yandex"])
+
+    assert report.provider("serpapi_yandex") is not None
+    assert report.provider("some_other_internal_name") is None
+    assert [p.engine for p in report.providers] == ["serpapi_yandex"]
+
+
+def test_serpapi_bing_is_registered_with_the_correct_serpapi_engine_id():
+    """Regression: the correct SerpAPI engine id for Bing reverse-image
+    search is "bing_reverse_image", not "bing" (which silently returns
+    nothing) — confirmed against SerpAPI's own documentation."""
+    from facechain.search.orchestrator import API_ADAPTERS
+    assert "serpapi_bing" in API_ADAPTERS
+    adapter = API_ADAPTERS["serpapi_bing"]()
+    assert adapter.serp_engine == "bing_reverse_image"
+
+
 # ---- search variants -----------------------------------------------------
 
 from facechain.search.variants import SearchVariant  # noqa: E402

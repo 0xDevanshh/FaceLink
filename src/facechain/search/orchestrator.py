@@ -54,6 +54,9 @@ BROWSER_ADAPTERS = {
 API_ADAPTERS = {
     "serpapi_google_lens": lambda: SerpApiAdapter("google_lens"),
     "serpapi_yandex": lambda: SerpApiAdapter("yandex_images"),
+    # SerpAPI's actual engine id is "bing_reverse_image" (confirmed against
+    # SerpAPI's own docs) — not "bing", which silently returns nothing.
+    "serpapi_bing": lambda: SerpApiAdapter("bing_reverse_image"),
 }
 
 # Error-text fingerprints, checked in order. Only used when an adapter did not
@@ -117,7 +120,14 @@ def _run_browser_engine(name: str, image_path: str, public_url: str | None) -> E
 
 
 def _run_api_engine(name: str, image_path: str, public_url: str | None) -> EngineResult:
-    return API_ADAPTERS[name]().search(image_path, public_url)
+    res = API_ADAPTERS[name]().search(image_path, public_url)
+    # `SerpApiAdapter.name` is derived from its own `serp_engine` id (e.g.
+    # "serpapi_yandex_images"), which does not always match the registry key
+    # a caller actually requested (e.g. "serpapi_yandex"). Normalising here
+    # keeps `report.providers`, the live progress events, and
+    # `engines_attempted` all referring to the same name for the same engine.
+    res.engine = name
+    return res
 
 
 def _run_engine_pass(
