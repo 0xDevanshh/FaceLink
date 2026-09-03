@@ -102,6 +102,9 @@ export default function ResultView({ scan, onViewEvidence, onNewScan }: Props) {
   const rejected = result.verification.filter((c) => !c.verified)
   const search = result.reverse_search
   const chain = result.blockchain
+  const thresholds = result.threshold_snapshot
+  const thresholdPct = thresholds ? Math.round(thresholds.face_match_threshold * 100) : 38
+  const graph = result.evidence_graph
 
   return (
     <div className="max-w-3xl mx-auto">
@@ -232,6 +235,26 @@ export default function ResultView({ scan, onViewEvidence, onNewScan }: Props) {
               marked TIMEOUT above were abandoned.
             </p>
           )}
+
+          {search.variants.length > 0 && (
+            <div className="mt-3 pt-2 border-t border-border/50">
+              <h3 className="text-xs text-muted uppercase tracking-wider mb-1">
+                Search variants (beyond the original upload)
+              </h3>
+              <div className="flex flex-wrap gap-2" data-testid="search-variants">
+                {search.variants.map((v) => (
+                  <span
+                    key={v.variant_id}
+                    className={`px-2 py-0.5 rounded text-xs font-mono border
+                      ${v.skipped ? 'border-border text-muted' : 'border-accent/50 text-accent'}`}
+                    title={v.skipped ? v.skip_reason : `${v.width}x${v.height}`}
+                  >
+                    {v.variant_type} {v.skipped ? '(skipped)' : `· +${v.candidates_found}`}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
         </section>
       )}
 
@@ -247,7 +270,11 @@ export default function ResultView({ scan, onViewEvidence, onNewScan }: Props) {
             {result.face.quality && (
               <>
                 <Kv k="Quality gate" v={result.face.quality.passed ? 'PASS' : (result.face.quality.error ?? 'FAIL')} />
-                <Kv k="Blur (Laplacian)" v={result.face.quality.blur_score.toFixed(1)} />
+                <Kv k="Overall quality" v={`${Math.round(result.face.quality.overall_quality * 100)}%`} />
+                {Object.entries(result.face.quality.bands).map(([metric, band]) => (
+                  <Kv key={metric} k={metric[0].toUpperCase() + metric.slice(1)} v={band} />
+                ))}
+                <Kv k="Pose (yaw / roll)" v={`${result.face.quality.yaw_deg.toFixed(1)}° / ${result.face.quality.roll_deg.toFixed(1)}°`} />
               </>
             )}
             {result.face_selection && (
@@ -291,6 +318,51 @@ export default function ResultView({ scan, onViewEvidence, onNewScan }: Props) {
         </section>
       )}
 
+      {/* Thresholds + corroboration. The exact config that decided this
+          verdict, and how much genuinely independent evidence backs it —
+          shown explicitly rather than left implicit in the final score. */}
+      {(thresholds || graph) && (
+        <section className="mb-6 bg-surface-1 border border-border rounded p-4" aria-labelledby="calibration-heading">
+          <h2 id="calibration-heading" className="text-sm font-semibold text-gray-300 mb-2">
+            Thresholds &amp; Corroboration
+          </h2>
+          <div className="grid grid-cols-2 gap-2 text-xs">
+            {thresholds && (
+              <>
+                <Kv k="Face match threshold" v={`${Math.round(thresholds.face_match_threshold * 100)}%`} />
+                <Kv k="Image match threshold" v={`${Math.round(thresholds.image_match_threshold * 100)}%`} />
+                <Kv k="Verify min score" v={`${Math.round(thresholds.verify_min_score * 100)}%`} />
+                <Kv k="Model" v={`${thresholds.insightface_model} / ${thresholds.face_backend}`} />
+                <div className="col-span-2">
+                  <span className="text-muted">Calibration: </span>
+                  <span className={
+                    thresholds.calibration_status === 'CALIBRATED' ? 'text-success font-mono'
+                    : thresholds.calibration_status === 'CALIBRATION_INSUFFICIENT' ? 'text-warn font-mono'
+                    : 'text-muted font-mono'
+                  }>
+                    {thresholds.calibration_status}
+                  </span>
+                  <span className="text-muted ml-2">{thresholds.calibration_note}</span>
+                </div>
+              </>
+            )}
+            {graph && (
+              <div className="col-span-2 mt-1 pt-2 border-t border-border/50">
+                <span className="text-muted">Independent evidence sources: </span>
+                <span className={`font-mono font-bold ${graph.independent_evidence_count >= 2 ? 'text-success' : 'text-muted'}`}>
+                  {graph.independent_evidence_count}
+                </span>
+                <span className="text-muted ml-2">
+                  ({graph.nodes.filter((n) => n.type === 'image').length} distinct image(s) across{' '}
+                  {graph.nodes.filter((n) => n.type === 'domain').length} domain(s) — reposts of the same
+                  photo count once, not once per URL)
+                </span>
+              </div>
+            )}
+          </div>
+        </section>
+      )}
+
       {/* Best match, called out explicitly. Chosen by evidential strength, so
           a strong match on the wider web outranks a weaker one on a priority
           platform — the platform name never promotes a candidate. */}
@@ -299,7 +371,7 @@ export default function ResultView({ scan, onViewEvidence, onNewScan }: Props) {
           <h2 id="best-heading" className="text-sm font-semibold text-gray-300 mb-3">
             Best candidate
           </h2>
-          <CandidateCard candidate={result.best_match} rank={0} />
+          <CandidateCard candidate={result.best_match} rank={0} thresholds={result.threshold_snapshot} />
         </section>
       )}
 
@@ -317,7 +389,7 @@ export default function ResultView({ scan, onViewEvidence, onNewScan }: Props) {
                 </h3>
                 <div className="space-y-3">
                   {group.map((c, i) => (
-                    <CandidateCard key={c.url} candidate={c} rank={i} />
+                    <CandidateCard key={c.url} candidate={c} rank={i} thresholds={result.threshold_snapshot} />
                   ))}
                 </div>
               </div>
@@ -341,7 +413,7 @@ export default function ResultView({ scan, onViewEvidence, onNewScan }: Props) {
           {showRejected && (
             <div className="space-y-3" role="list" aria-label="Rejected candidates">
               {rejected.map((c) => (
-                <CandidateCard key={c.url} candidate={c} />
+                <CandidateCard key={c.url} candidate={c} thresholds={result.threshold_snapshot} />
               ))}
             </div>
           )}
@@ -457,7 +529,7 @@ export default function ResultView({ scan, onViewEvidence, onNewScan }: Props) {
 
       <p className="mt-6 text-xs text-muted">
         Scope: face similarity {result.best_match ? `${Math.round(result.best_match.face_similarity * 100)}%` : 'N/A'} at
-        threshold 38% under recorded config. This record attests that the input image and its primary face
+        threshold {thresholdPct}% under recorded config. This record attests that the input image and its primary face
         match the retrieved public image. <strong className="text-gray-300">Not an identity claim.</strong>
       </p>
     </div>

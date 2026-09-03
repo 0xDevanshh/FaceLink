@@ -208,3 +208,48 @@ def test_gate_reports_no_face_when_nothing_was_detected():
     assert report.face_count == 0
 
 
+# ---- graded quality metrics (informational, never gate on their own) ----
+
+def test_a_good_pass_gets_good_bands_and_high_overall_quality():
+    img = canvas()
+    big = face(50, 50, 350, 400, score=0.95)
+    report = fs.gate_selected(img, [big], face_index=0)
+    assert report.passed
+    assert report.bands["detection"] == "PASS"
+    assert report.bands["resolution"] == "GOOD"
+    assert report.overall_quality > 0.5
+
+
+def test_a_marginal_pass_still_reports_graded_metrics():
+    """A face just above the hard floor should pass but read as lower quality,
+    not be silently indistinguishable from a great photo."""
+    img = canvas()
+    marginal = face(50, 50, 50 + settings.min_face_px + 2, 50 + settings.min_face_px + 2)
+    report = fs.gate_selected(img, [marginal], face_index=0)
+    assert report.passed
+    assert report.bands["resolution"] in ("ACCEPTABLE", "POOR")
+    assert report.overall_quality < 1.0
+
+
+def test_rejected_reports_still_carry_graded_metrics_for_the_primary_face():
+    """MULTI_FACE / FACE_TOO_SMALL rejections should still explain *why* via
+    bands rather than leaving the operator with only a bare error code."""
+    img = canvas()
+    tiny = face(500, 700, 500 + settings.min_face_px - 20, 700 + settings.min_face_px - 20)
+    report = fs.gate_selected(img, [tiny], face_index=0)
+    assert not report.passed
+    assert report.error == QualityError.FACE_TOO_SMALL.value
+    assert report.bands  # populated, not empty
+    assert report.bands["detection"] == "PASS"
+
+
+def test_frontal_face_has_low_pose_angles():
+    img = canvas()
+    frontal = face(100, 100, 300, 340, score=0.95)
+    report = fs.gate_selected(img, [frontal], face_index=0)
+    # No landmarks on this synthetic face -> pose defaults to 0.
+    assert report.yaw_deg == pytest.approx(0.0)
+    assert report.roll_deg == pytest.approx(0.0)
+    assert report.bands["pose"] == "GOOD"
+
+

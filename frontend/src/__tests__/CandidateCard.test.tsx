@@ -20,6 +20,10 @@ function makeCandidate(overrides: Partial<VerifiedCandidate> = {}): VerifiedCand
     candidate_image_sha256: 'dd'.repeat(32),
     candidate_image_phash: 'fafc13e1a083a6d8',
     candidate_faces_found: 1,
+    candidate_face_index: 0,
+    candidate_face_quality: 0.85,
+    candidate_face_bands: {},
+    found_via_variant: '',
     image_similarity: 0.95,
     face_detected: true,
     face_similarity: 0.92,
@@ -68,6 +72,39 @@ describe('CandidateCard', () => {
   it('shows STRONG confidence band', () => {
     render(<CandidateCard candidate={makeCandidate({ confidence_band: 'STRONG' })} />)
     expect(screen.getByText('STRONG')).toBeInTheDocument()
+  })
+
+  it('uses the recorded threshold snapshot instead of a hardcoded value', () => {
+    // Regression: the score bar used to hard-code 0.38/0.80 regardless of
+    // what the scan was actually configured with.
+    render(
+      <CandidateCard
+        candidate={makeCandidate({ face_similarity: 0.5 })}
+        thresholds={{
+          face_match_threshold: 0.6, image_match_threshold: 0.9, verify_min_score: 0.7,
+          weight_face: 0.5, weight_image: 0.4, weight_meta: 0.1,
+          insightface_model: 'buffalo_l', face_backend: 'insightface',
+          calibration_status: 'DEFAULT', calibration_note: '',
+        }}
+      />
+    )
+    // The marker for a 0.6 threshold sits at 60%, not the old hard-coded 38%.
+    expect(screen.getByTestId('threshold-marker-Face sim')).toHaveStyle({ left: '60%' })
+    expect(screen.getByTestId('threshold-marker-Image sim')).toHaveStyle({ left: '90%' })
+  })
+
+  it('falls back to the documented default thresholds when no snapshot is given', () => {
+    render(<CandidateCard candidate={makeCandidate()} />)
+    expect(screen.getByTestId('threshold-marker-Face sim')).toHaveStyle({ left: '38%' })
+    expect(screen.getByTestId('threshold-marker-Image sim')).toHaveStyle({ left: '80%' })
+  })
+
+  it('shows which candidate face matched when the candidate has multiple faces', () => {
+    render(<CandidateCard candidate={makeCandidate({
+      candidate_faces_found: 3, candidate_face_index: 1, candidate_face_quality: 0.72,
+    })} />)
+    expect(screen.getByText(/matched face #2/i)).toBeInTheDocument()
+    expect(screen.getByText('72%')).toBeInTheDocument()
   })
 
   it('renders Instagram platform icon', () => {

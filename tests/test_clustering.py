@@ -184,6 +184,36 @@ class TestCorroborationSummary:
         assert len(clusters) == 1
         assert len(clusters[0].domains) == 2
 
+    def test_verified_only_excludes_unverified_clusters(self):
+        """Regression: `verified_only=True` used to be silently ignored — the
+        summary counted every cluster regardless of the flag."""
+        verified = _make("https://linkedin.com/in/alice", phash="0011", platform="LinkedIn",
+                         face_sim=0.85, verified=True)
+        unverified = _make("https://random-blog.example/post", phash="ff00",
+                           face_sim=0.20, verified=False)
+        clusters = cluster_candidates([verified, unverified])
+
+        everything = corroboration_summary(clusters, verified_only=False)
+        assert everything.image_clusters == 2
+        assert everything.total_candidates == 2
+
+        confirmed_only = corroboration_summary(clusters, verified_only=True)
+        assert confirmed_only.image_clusters == 1
+        assert confirmed_only.total_candidates == 1
+        assert confirmed_only.verified_clusters == 1
+        assert confirmed_only.independent_platforms == 1
+        assert confirmed_only.independent_domains == 1
+
+    def test_verified_only_with_no_verified_clusters_is_honestly_empty(self):
+        a = _make("https://a.com/x", phash="aabb", face_sim=0.10, verified=False)
+        b = _make("https://b.com/x", phash="ccdd", face_sim=0.15, verified=False)
+        clusters = cluster_candidates([a, b])
+        s = corroboration_summary(clusters, verified_only=True)
+        assert s.image_clusters == 0
+        assert s.total_candidates == 0
+        assert s.independent_domains == 0
+        assert s.best_face_similarity == 0.0
+
 
 # ------------------------------------------------------------------
 # Gravatar / image-only match must still be REJECTED

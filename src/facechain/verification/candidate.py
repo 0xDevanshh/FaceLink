@@ -26,7 +26,8 @@ from ..config import settings
 from ..evidence.hashing import sha256_bytes
 from ..face.encoder import decode_image
 from ..face.detector import load_backend
-from ..face.similarity import best_cosine
+from ..face.quality import score_face_quality
+from ..face.similarity import best_match_index
 from ..models import SearchCandidate, VerifiedCandidate
 from ..search.base import canonicalise_url, classify_platform
 from ..security.ssrf import SSRFViolation, safe_url_or_none
@@ -205,9 +206,15 @@ class MediaCache:
         self._store: dict[str, bytes | None] = {}
         self._max_entries = max_entries
         self._max_bytes = max_bytes
-        self._bytes = 0
+        self._bytes = 0  # bytes actually held in the cache store (bounded)
         self.hits = 0
         self.downloads = 0
+        # Real cumulative bytes pulled over the wire this run — unlike `_bytes`,
+        # this keeps counting once the cache store is full, so a caller
+        # enforcing a total download budget (e.g. `runner.MAX_DOWNLOAD_BYTES`)
+        # sees what was actually downloaded rather than an estimate that goes
+        # stale the moment the bounded cache stops growing.
+        self.total_bytes = 0
 
     def get_or_fetch(self, client: httpx.Client, url: str) -> bytes | None:
         if url in self._store:
@@ -215,12 +222,17 @@ class MediaCache:
             return self._store[url]
         self.downloads += 1
         data = _download_image(client, url)
+        self.total_bytes += len(data or b"")
         # Negative results are cached too: a URL that failed SSRF or returned a
         # non-image will fail identically for every candidate that references it.
         if len(self._store) < self._max_entries and self._bytes < self._max_bytes:
             self._store[url] = data
             self._bytes += len(data or b"")
         return data
+
+    def record_page_bytes(self, n: int) -> None:
+        """Count bytes fetched outside `get_or_fetch` (candidate page HTML)."""
+        self.total_bytes += n
 
 
 def _download_image(client: httpx.Client, url: str, referer: str | None = None) -> bytes | None:
@@ -279,6 +291,7 @@ def verify_candidate(
             resp, final_url = _safe_get(client, candidate.url)
             if resp is not None and resp.status_code == 200:
                 ctype = resp.headers.get("content-type", "")
+                cache.record_page_bytes(len(resp.content))
                 if "html" in ctype:
                     # Size cap on page HTML.
                     raw = resp.content[:MAX_PAGE_BYTES].decode("utf-8", "replace")
@@ -343,7 +356,14 @@ def verify_candidate(
             vc.candidate_faces_found = len(faces)
             vc.face_detected = bool(faces)
             if faces:
-                vc.face_similarity = best_cosine(input_embedding, [f.embedding for f in faces])
+                vc.face_similarity, idx = best_match_index(
+                    input_embedding, [f.embedding for f in faces]
+                )
+                vc.candidate_face_index = idx
+                if idx >= 0:
+                    bands, overall = score_face_quality(img, faces[idx])
+                    vc.candidate_face_quality = overall
+                    vc.candidate_face_bands = bands
         except Exception as exc:  # noqa: BLE001
             log.warning("candidate face pass failed for %s: %s", candidate.url, exc)
 

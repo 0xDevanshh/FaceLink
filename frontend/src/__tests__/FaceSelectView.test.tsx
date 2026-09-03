@@ -24,7 +24,11 @@ function detection(overrides: Partial<FaceDetectResponse> = {}): FaceDetectRespo
     auto_index: null,
     selection_required: true,
     reason: '2 faces of comparable size were detected — choose which one the scan is about.',
-    quality: { passed: true, error: null, detail: '', blur_score: 130.2, face_px: 200, face_count: 2 },
+    quality: {
+      passed: true, error: null, detail: '', blur_score: 130.2, face_px: 200, face_count: 2,
+      det_score: 0.9, yaw_deg: 1.0, roll_deg: 0.5, brightness: 150,
+      bands: { detection: 'PASS', resolution: 'GOOD' }, overall_quality: 0.9,
+    },
     ...overrides,
   }
 }
@@ -196,7 +200,12 @@ describe('FaceSelectView', () => {
 
   it('surfaces a failing quality gate', () => {
     view(detection({
-      quality: { passed: false, error: 'BLURRY', detail: 'Laplacian variance 12.3 < threshold 40.0', blur_score: 12.3, face_px: 200, face_count: 2 },
+      quality: {
+        passed: false, error: 'BLURRY', detail: 'Laplacian variance 12.3 < threshold 40.0',
+        blur_score: 12.3, face_px: 200, face_count: 2,
+        det_score: 0.9, yaw_deg: 1.0, roll_deg: 0.5, brightness: 150,
+        bands: { detection: 'PASS', blur: 'POOR' }, overall_quality: 0.3,
+      },
     }))
     expect(screen.getByText('BLURRY')).toBeInTheDocument()
     expect(screen.getByText(/Laplacian variance/)).toBeInTheDocument()

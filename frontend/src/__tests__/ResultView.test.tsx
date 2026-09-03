@@ -25,6 +25,10 @@ function makeCandidate(verified: boolean, overrides: Partial<VerifiedCandidate> 
     candidate_image_sha256: 'dd'.repeat(32),
     candidate_image_phash: 'aabb',
     candidate_faces_found: 1,
+    candidate_face_index: 0,
+    candidate_face_quality: 0.85,
+    candidate_face_bands: {},
+    found_via_variant: '',
     image_similarity: 0.95,
     face_detected: true,
     face_similarity: verified ? 0.92 : 0.10,
@@ -82,10 +86,13 @@ const BASE_RESULT: CaseResult = {
     ],
     platform_counts: { LinkedIn: 0, Instagram: 2, 'X/Twitter': 0, GitHub: 0, YouTube: 0, 'Other Web': 3 },
     timed_out: false,
+    variants: [],
   },
   verification: [makeCandidate(true)],
   best_match: makeCandidate(true),
   stages_passed: ['SEARCH_FOUND', 'SOCIAL_MATCH', 'IMAGE_MATCH', 'FACE_MATCH', 'VERIFIED'],
+  evidence_graph: null,
+  threshold_snapshot: null,
   blockchain: null,
 }
 
@@ -177,6 +184,100 @@ describe('ResultView', () => {
     expect(counts.textContent).toMatch(/LinkedIn 0/)
     expect(counts.textContent).toMatch(/GitHub 0/)
     expect(counts.textContent).toMatch(/Instagram 2/)
+  })
+
+  it('shows the recorded threshold snapshot and calibration status', () => {
+    const result = {
+      ...BASE_RESULT,
+      threshold_snapshot: {
+        face_match_threshold: 0.38, image_match_threshold: 0.80, verify_min_score: 0.70,
+        weight_face: 0.5, weight_image: 0.4, weight_meta: 0.1,
+        insightface_model: 'buffalo_l', face_backend: 'insightface',
+        calibration_status: 'CALIBRATION_INSUFFICIENT',
+        calibration_note: 'Only 1 genuine and 1 impostor pair supplied.',
+      },
+    }
+    render(<ResultView scan={makeScan(result)} onViewEvidence={vi.fn()} onNewScan={vi.fn()} />)
+    expect(screen.getByText('CALIBRATION_INSUFFICIENT')).toBeInTheDocument()
+    expect(screen.getByText(/Only 1 genuine and 1 impostor pair/)).toBeInTheDocument()
+    // The footer must use the real recorded threshold, not a hard-coded 38%.
+    expect(screen.getByText(/threshold 38%/)).toBeInTheDocument()
+  })
+
+  it('falls back to 38% in the footer when no threshold snapshot was recorded', () => {
+    render(<ResultView scan={makeScan(BASE_RESULT)} onViewEvidence={vi.fn()} onNewScan={vi.fn()} />)
+    expect(screen.getByText(/threshold 38%/)).toBeInTheDocument()
+  })
+
+  it('shows the independent evidence count from the evidence graph', () => {
+    const result = {
+      ...BASE_RESULT,
+      evidence_graph: {
+        nodes: [
+          { id: 'image:0', type: 'image', label: 'image cluster (1 URL(s))' },
+          { id: 'domain:linkedin.com', type: 'domain', label: 'linkedin.com' },
+          { id: 'image:1', type: 'image', label: 'image cluster (1 URL(s))' },
+          { id: 'domain:github.com', type: 'domain', label: 'github.com' },
+        ],
+        edges: [],
+        independent_evidence_count: 2,
+      },
+    }
+    render(<ResultView scan={makeScan(result)} onViewEvidence={vi.fn()} onNewScan={vi.fn()} />)
+    expect(screen.getByText('Independent evidence sources:').nextElementSibling).toHaveTextContent('2')
+    expect(screen.getByText(/2 distinct image\(s\) across 2 domain\(s\)/)).toBeInTheDocument()
+  })
+
+  it('shows search variant chips with their candidate counts', () => {
+    const result = {
+      ...BASE_RESULT,
+      reverse_search: {
+        ...BASE_RESULT.reverse_search!,
+        variants: [
+          { variant_id: 'v0-original', variant_type: 'original', sha256: '', width: 0, height: 0,
+            candidates_found: 0, skipped: false, skip_reason: '' },
+          { variant_id: 'v1-tight_crop', variant_type: 'tight_crop', sha256: 'aa', width: 400, height: 400,
+            candidates_found: 3, skipped: false, skip_reason: '' },
+        ],
+      },
+    }
+    render(<ResultView scan={makeScan(result)} onViewEvidence={vi.fn()} onNewScan={vi.fn()} />)
+    const section = screen.getByTestId('search-variants')
+    expect(section.textContent).toMatch(/tight_crop/)
+    expect(section.textContent).toMatch(/\+3/)
+  })
+
+  it('marks a skipped search variant distinctly from one that ran', () => {
+    const result = {
+      ...BASE_RESULT,
+      reverse_search: {
+        ...BASE_RESULT.reverse_search!,
+        variants: [
+          { variant_id: 'v1-loose_crop', variant_type: 'loose_crop', sha256: 'bb', width: 500, height: 500,
+            candidates_found: 0, skipped: true, skip_reason: 'overall search budget exhausted' },
+        ],
+      },
+    }
+    render(<ResultView scan={makeScan(result)} onViewEvidence={vi.fn()} onNewScan={vi.fn()} />)
+    expect(screen.getByText(/loose_crop \(skipped\)/)).toBeInTheDocument()
+  })
+
+  it('shows graded face quality bands', () => {
+    const result = {
+      ...BASE_RESULT,
+      face: {
+        ...BASE_RESULT.face!,
+        quality: {
+          passed: true, error: null, detail: '', blur_score: 120, face_px: 200, face_count: 1,
+          det_score: 0.9, yaw_deg: 2.1, roll_deg: 1.0, brightness: 160,
+          bands: { detection: 'PASS', resolution: 'GOOD', blur: 'GOOD' },
+          overall_quality: 0.91,
+        },
+      },
+    }
+    render(<ResultView scan={makeScan(result)} onViewEvidence={vi.fn()} onNewScan={vi.fn()} />)
+    expect(screen.getByText('Overall quality:').nextElementSibling).toHaveTextContent('91%')
+    expect(screen.getAllByText('GOOD', { exact: true }).length).toBeGreaterThan(0)
   })
 
   it('calls onViewEvidence when button clicked', () => {

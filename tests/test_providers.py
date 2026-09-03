@@ -223,3 +223,94 @@ def test_recognised_but_unprioritised_platform_counts_as_other_web():
     counts = count_by_platform(cands)
     assert counts.get("Facebook", 0) == 1
     assert counts["LinkedIn"] == 0
+
+
+# ---- search variants -----------------------------------------------------
+
+from facechain.search.variants import SearchVariant  # noqa: E402
+
+
+@pytest.fixture
+def path_aware_adapters(monkeypatch):
+    """Like `stub_adapters`, but the behaviour sees which image path was
+    searched — needed to prove a variant pass actually re-searched a
+    *different* image rather than repeating the original's query."""
+    behaviours: dict[str, callable] = {}
+
+    def runner(name, image_path, public_url):
+        return behaviours[name](image_path)
+
+    monkeypatch.setattr(orchestrator, "BROWSER_ADAPTERS", {})
+    monkeypatch.setattr(orchestrator, "API_ADAPTERS", behaviours)
+    monkeypatch.setattr(orchestrator, "_run_api_engine", runner)
+    return behaviours
+
+
+def test_no_variants_behaves_exactly_like_the_historical_single_search(path_aware_adapters):
+    path_aware_adapters.update({
+        "good": lambda p: _result("good", ["https://github.com/someone"]),
+    })
+    report, _ = run_reverse_search("original.jpg", engines=["good"])
+    assert report.total_candidates == 1
+    assert report.variants == []  # no extra passes ran
+    assert report.candidates[0].found_via_variant == ""
+
+
+def test_an_extra_variant_pass_finds_additional_candidates(path_aware_adapters):
+    def good(image_path: str):
+        if image_path == "original.jpg":
+            return _result("good", ["https://github.com/someone"])
+        return _result("good", ["https://linkedin.com/in/someone"])
+
+    path_aware_adapters["good"] = good
+    variant = SearchVariant(
+        variant_id="v1-tight_crop", variant_type="tight_crop",
+        image_path="crop.png", sha256="deadbeef", width=200, height=200,
+    )
+    report, _ = run_reverse_search("original.jpg", engines=["good"], variants=[variant])
+
+    assert report.total_candidates == 2
+    urls = {c.url for c in report.candidates}
+    assert "https://github.com/someone" in urls
+    assert "https://linkedin.com/in/someone" in urls
+    # The variant-only hit is attributed to the variant that found it.
+    linkedin = next(c for c in report.candidates if "linkedin" in c.url)
+    assert linkedin.found_via_variant == "v1-tight_crop"
+    github = next(c for c in report.candidates if "github" in c.url)
+    assert github.found_via_variant == ""
+    # And the report records the variant pass itself.
+    assert len(report.variants) == 2  # original summary + the tight_crop pass
+    tight = next(v for v in report.variants if v.variant_id == "v1-tight_crop")
+    assert tight.candidates_found == 1
+    assert not tight.skipped
+
+
+def test_a_variant_that_finds_nothing_new_is_still_recorded(path_aware_adapters):
+    path_aware_adapters["good"] = lambda p: _result("good", ["https://github.com/someone"])
+    variant = SearchVariant(
+        variant_id="v1-tight_crop", variant_type="tight_crop",
+        image_path="crop.png", sha256="deadbeef", width=200, height=200,
+    )
+    report, _ = run_reverse_search("original.jpg", engines=["good"], variants=[variant])
+    assert report.total_candidates == 1  # same URL from both passes, deduped
+    tight = next(v for v in report.variants if v.variant_id == "v1-tight_crop")
+    assert tight.candidates_found == 0
+
+
+def test_the_original_path_is_never_treated_as_an_extra_variant(path_aware_adapters):
+    """A variant list that happens to include the primary path itself (e.g. a
+    budget of 1) must not trigger a redundant second pass."""
+    calls: list[str] = []
+
+    def good(image_path: str):
+        calls.append(image_path)
+        return _result("good", ["https://github.com/someone"])
+
+    path_aware_adapters["good"] = good
+    variant = SearchVariant(
+        variant_id="v0-original", variant_type="original",
+        image_path="original.jpg", sha256="x", width=1, height=1,
+    )
+    report, _ = run_reverse_search("original.jpg", engines=["good"], variants=[variant])
+    assert calls == ["original.jpg"]
+    assert report.variants == []

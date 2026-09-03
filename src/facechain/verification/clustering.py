@@ -146,24 +146,30 @@ def corroboration_summary(
     clusters: list[ImageCluster],
     verified_only: bool = False,
 ) -> CorroborationSummary:
-    """Aggregate the evidence-independence picture."""
+    """Aggregate the evidence-independence picture.
+
+    `verified_only=True` restricts every figure to clusters whose canonical
+    candidate actually verified — useful for a caller asking "how much
+    *confirmed* independent evidence is there", as opposed to the default
+    "how much evidence was found at all" (which includes weak/rejected hits).
+    """
     subject = [c for c in clusters if c.canonical.verified] if verified_only else clusters
 
     domains: set[str] = set()
     platforms: set[str] = set()
     best_sim = 0.0
 
-    for cl in clusters:
+    for cl in subject:
         domains.update(cl.domains)
         platforms.update(pl for pl in cl.platforms if pl)
         best_sim = max(best_sim, cl.best_face_similarity)
 
     return CorroborationSummary(
-        total_candidates=sum(cl.size for cl in clusters),
-        image_clusters=len(clusters),
-        duplicate_count=sum(len(cl.duplicates) for cl in clusters),
+        total_candidates=sum(cl.size for cl in subject),
+        image_clusters=len(subject),
+        duplicate_count=sum(len(cl.duplicates) for cl in subject),
         independent_domains=len(domains),
         independent_platforms=len(platforms),
-        verified_clusters=sum(1 for cl in clusters if cl.canonical.verified),
+        verified_clusters=sum(1 for cl in subject if cl.canonical.verified),
         best_face_similarity=best_sim,
     )

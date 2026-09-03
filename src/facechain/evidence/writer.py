@@ -109,6 +109,21 @@ class EvidenceWriter:
             face_selection_mode=selection.mode if selection else "auto",
             face_crop_sha256=(selection.crop_sha256 or "") if selection else "",
             provider_summary=providers,
+            independent_evidence_count=(
+                case.evidence_graph.independent_evidence_count if case.evidence_graph else 0
+            ),
+            face_match_threshold=(
+                case.threshold_snapshot.face_match_threshold if case.threshold_snapshot else 0.0
+            ),
+            image_match_threshold=(
+                case.threshold_snapshot.image_match_threshold if case.threshold_snapshot else 0.0
+            ),
+            verify_min_score=(
+                case.threshold_snapshot.verify_min_score if case.threshold_snapshot else 0.0
+            ),
+            calibration_status=(
+                case.threshold_snapshot.calibration_status if case.threshold_snapshot else "DEFAULT"
+            ),
         )
 
     def write_payload(self, payload: AttestedPayload) -> tuple[Path, str]:
@@ -156,6 +171,10 @@ class EvidenceWriter:
                 "verification.json",
                 {"candidates": [c.rounded().model_dump(mode="json") for c in case.verification]},
             )
+        if case.evidence_graph:
+            self.save_json("evidence_graph.json", case.evidence_graph)
+        if case.threshold_snapshot:
+            self.save_json("threshold_snapshot.json", case.threshold_snapshot)
         if case.best_match and case.best_match.candidate_image_sha256:
             self.save_digest(
                 "matched_image.sha256",

@@ -16,6 +16,8 @@ const FILES = [
   { name: 'matched_image.sha256', desc: 'Hash of retrieved candidate image' },
   { name: 'reverse_search.json', desc: 'All candidates from all engines' },
   { name: 'verification.json', desc: 'Per-candidate measurements' },
+  { name: 'evidence_graph.json', desc: 'Corroboration graph — nodes, edges, independent sources' },
+  { name: 'threshold_snapshot.json', desc: 'Exact thresholds/weights that governed this scan' },
   { name: 'blockchain.json', desc: 'On-chain record (if attested)' },
   { name: 'attestation.txt', desc: 'Human-readable receipt' },
 ]
@@ -193,6 +195,8 @@ function FileJson({
   if (name === 'case.json') content = result
   else if (name === 'reverse_search.json') content = result.reverse_search
   else if (name === 'verification.json') content = { candidates: result.verification }
+  else if (name === 'evidence_graph.json') content = result.evidence_graph
+  else if (name === 'threshold_snapshot.json') content = result.threshold_snapshot
   else if (name === 'blockchain.json') content = result.blockchain
 
   if (!content) {

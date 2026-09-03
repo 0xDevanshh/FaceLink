@@ -90,6 +90,28 @@ describe('ProgressView', () => {
     expect(screen.getByLabelText('bing: fail')).toBeInTheDocument()
   })
 
+  it('does not create an engine chip out of a search-variant sub-event', () => {
+    // Regression: `search:variant:tight_crop:yandex` used to be parsed as an
+    // engine named "variant:tight_crop:yandex".
+    const events = [
+      makeEvt('search:yandex', 'ok', '60 candidates'),
+      makeEvt('search:variant:tight_crop:yandex', 'ok', '5 candidates'),
+    ]
+    render(<ProgressView caseId="case_test" events={events} />)
+    expect(screen.getByLabelText('yandex: ok')).toBeInTheDocument()
+    expect(screen.queryByLabelText(/variant:tight_crop:yandex/)).not.toBeInTheDocument()
+  })
+
+  it('renders a search-variant chip separately from engine chips', () => {
+    const events = [
+      makeEvt('search:variant:tight_crop', 'start', 'v1-tight_crop'),
+      makeEvt('search:variant:tight_crop', 'ok', '3 new candidate(s)'),
+    ]
+    render(<ProgressView caseId="case_test" events={events} />)
+    const section = screen.getByText('Search Variants').closest('section')!
+    expect(section.textContent).toMatch(/tight_crop/)
+  })
+
   it('renders candidate log with title attribute', () => {
     const events = [
       makeEvt('verify:candidate', 'ok', 'instagram.com img 0.95 face 0.92 score 0.88 VERIFIED'),

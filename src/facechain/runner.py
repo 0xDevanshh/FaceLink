@@ -16,6 +16,7 @@ from typing import Callable
 import cv2
 
 from . import PIPELINE_VERSION
+from .benchmark import load_calibration_status
 from .chain.eas import ChainError, EasClient, InsufficientFunds
 from .chain.schema import schema_uid as predict_schema_uid
 from .config import EAS_SCHEMA_DEFINITION, settings
@@ -24,9 +25,14 @@ from .evidence.writer import EvidenceWriter, new_case_id
 from .face import selection as face_selection
 from .face.encoder import crop_face, encode_detected, read_image
 from .face.detector import load_backend
-from .models import Case, ChainRecord, FaceRecord, FaceSelection, InputImage, VerifiedCandidate
+from .models import (
+    Case, ChainRecord, EvidenceGraphEdge, EvidenceGraphNode, EvidenceGraphReport,
+    FaceRecord, FaceSelection, InputImage, ThresholdSnapshot, VerifiedCandidate,
+)
 from .search.orchestrator import run_reverse_search
+from .search.variants import generate_variants, cleanup_variants
 from .verification.candidate import MediaCache, verify_candidate
+from .verification.evidence_graph import build_evidence_graph
 from .verification.image_similarity import perceptual_hashes
 from .verification.scorer import explain_failure, highest_stage_reached, rank, score_candidate
 
@@ -128,11 +134,24 @@ def run(opts: RunOptions, report: Reporter | None = None) -> Case:
     case_id = opts.case_id or new_case_id(now)
     writer = EvidenceWriter(case_id)
 
+    calibration_status, calibration_note = load_calibration_status(settings.calibration_file)
     case = Case(
         case_id=case_id,
         pipeline_version=PIPELINE_VERSION,
         created_at=now.isoformat(),
         observed_at=int(now.timestamp()),
+        threshold_snapshot=ThresholdSnapshot(
+            face_match_threshold=settings.face_match_threshold,
+            image_match_threshold=settings.image_match_threshold,
+            verify_min_score=settings.verify_min_score,
+            weight_face=settings.weight_face,
+            weight_image=settings.weight_image,
+            weight_meta=settings.weight_meta,
+            insightface_model=settings.insightface_model,
+            face_backend=opts.face_backend or settings.face_backend,
+            calibration_status=calibration_status,
+            calibration_note=calibration_note,
+        ),
     )
 
     # ---- 1. input --------------------------------------------------------
@@ -323,13 +342,26 @@ def run(opts: RunOptions, report: Reporter | None = None) -> Case:
     if crop_path is not None:
         emit("search:query", "info", "searching the selected crop, not the full upload")
 
+    # Search-variant generation (see `search/variants.py`): beyond `fast` depth,
+    # also search one or two crops around the selected face, budgeted and
+    # deduplicated so a headshot-sized upload does not burn extra search passes
+    # on crops indistinguishable from the original.
+    variants = generate_variants(working, str(search_path), primary, opts.scan_depth)
+    if len(variants) > 1:
+        emit("search:query", "info",
+             f"generated {len(variants)} search variant(s) for scan_depth={opts.scan_depth}")
+
     emit("search", "start", "")
-    search_report, public_url = run_reverse_search(
-        str(search_path),
-        engines=opts.engines,
-        image_url=opts.image_url,
-        on_event=lambda eng, status, detail: emit(f"search:{eng}", status, detail),
-    )
+    try:
+        search_report, public_url = run_reverse_search(
+            str(search_path),
+            engines=opts.engines,
+            image_url=opts.image_url,
+            on_event=lambda eng, status, detail: emit(f"search:{eng}", status, detail),
+            variants=variants,
+        )
+    finally:
+        cleanup_variants(variants, keep_path=str(search_path))
     case.reverse_search = search_report
     # Report every provider's terminal state, including the ones that found
     # nothing — "we asked Bing and it challenged us" is part of the record.
@@ -385,7 +417,7 @@ def run(opts: RunOptions, report: Reporter | None = None) -> Case:
                 rejection_reason=f"verification error: {type(exc).__name__}",
             )
         verified.append(vc)
-        download_bytes = media_cache.downloads * 500_000  # rough estimate for budget guard
+        download_bytes = media_cache.total_bytes  # actual bytes downloaded this run
         emit(
             "verify:candidate",
             "ok" if vc.verified else "info",
@@ -398,7 +430,8 @@ def run(opts: RunOptions, report: Reporter | None = None) -> Case:
             # Standard/fast: stop at first verified match to save time
             pass  # still process remainder so full ranked list is available
     emit("verify:media", "info",
-         f"{media_cache.downloads} image download(s), {media_cache.hits} reused from cache")
+         f"{media_cache.downloads} image download(s), {media_cache.hits} reused from cache, "
+         f"{media_cache.total_bytes / (1024*1024):.1f}MB total")
 
     # ---- 4b. image deduplication + corroboration -------------------------
     clusters = cluster_candidates(verified)
@@ -412,6 +445,17 @@ def run(opts: RunOptions, report: Reporter | None = None) -> Case:
     if corr.duplicate_count > 0:
         emit("verify:duplicates", "info",
              f"{corr.duplicate_count} near-duplicate image(s) grouped — count as 1 evidence cluster each")
+
+    graph = build_evidence_graph(clusters)
+    case.evidence_graph = EvidenceGraphReport(
+        nodes=[EvidenceGraphNode(id=n.id, type=n.type, label=n.label) for n in graph.nodes],
+        edges=[EvidenceGraphEdge(source=e.source, target=e.target, type=e.type, note=e.note)
+               for e in graph.edges],
+        independent_evidence_count=graph.independent_evidence_count,
+    )
+    emit("verify:evidence_graph", "info",
+         f"{graph.independent_evidence_count} independent evidence source(s) "
+         f"({len(graph.nodes)} nodes, {len(graph.edges)} relationships)")
 
     ranked = rank(verified)
     case.verification = ranked

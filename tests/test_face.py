@@ -14,7 +14,7 @@ import cv2
 import numpy as np
 import pytest
 
-from facechain.face.similarity import best_cosine, cosine
+from facechain.face.similarity import best_cosine, best_match_index, cosine
 from facechain.verification.image_similarity import compare, perceptual_hashes
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -59,6 +59,21 @@ def test_best_cosine_picks_the_best_face_in_a_group_photo():
 
 def test_best_cosine_of_no_faces_is_zero():
     assert best_cosine(np.ones(512), []) == 0.0
+
+
+def test_best_match_index_reports_which_face_won():
+    ref = np.random.RandomState(4).randn(512).astype(np.float32)
+    others = [np.random.RandomState(i).randn(512).astype(np.float32) for i in (5, 6)]
+    candidates = others + [ref]  # the matching face is index 2
+    score, idx = best_match_index(ref, candidates)
+    assert idx == 2
+    assert score == pytest.approx(1.0, abs=1e-5)
+
+
+def test_best_match_index_of_no_faces_is_minus_one():
+    score, idx = best_match_index(np.ones(512), [])
+    assert score == 0.0
+    assert idx == -1
 
 
 # ---- perceptual hashing --------------------------------------------------
@@ -153,3 +168,79 @@ def test_no_face_in_a_blank_image():
 
     record, embedding, faces = encode_face(np.full((640, 640, 3), 220, dtype=np.uint8))
     assert not record.detected and embedding is None and faces == []
+
+
+@pytest.mark.skipif(len(SAMPLES) < 2, reason="needs two different people in samples/")
+def test_candidate_verification_finds_the_matching_face_in_a_group_photo():
+    """A candidate image showing two people must report *which* face matched,
+    not just that a face matched somewhere in the frame."""
+    from facechain.config import settings
+    from facechain.face.detector import load_backend
+    from facechain.face.encoder import encode_face, read_image
+
+    img_a, img_b = read_image(SAMPLES[0]), read_image(SAMPLES[1])
+    _, ref_embedding, _ = encode_face(img_a)
+
+    # Build a synthetic "group photo": person B on the left, person A on the
+    # right, so the correct match is not the first face the detector reports.
+    h = 480
+    a_resized = cv2.resize(img_a, (int(img_a.shape[1] * h / img_a.shape[0]), h))
+    b_resized = cv2.resize(img_b, (int(img_b.shape[1] * h / img_b.shape[0]), h))
+    group = np.hstack([b_resized, a_resized])
+    ok, buf = cv2.imencode(".jpg", group, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    assert ok
+    group_bytes = buf.tobytes()
+
+    faces_in_group = load_backend().detect(group)
+    assert len(faces_in_group) >= 2, "test setup needs both faces detected in the composite"
+
+    # Exercise the same face-matching path `verify_candidate` uses internally
+    # (see `verification/candidate.py`) without a network fetch.
+    from facechain.face.encoder import decode_image
+    from facechain.face.similarity import best_match_index
+
+    decoded = decode_image(group_bytes)
+    faces = load_backend().detect(decoded)
+    sim, idx = best_match_index(ref_embedding, [f.embedding for f in faces])
+    assert idx != -1
+    assert sim > settings.face_match_threshold
+    # The matched face's own bbox should sit in the right half of the frame,
+    # where person A (the reference) was placed.
+    x1, _, x2, _ = faces[idx].bbox
+    assert (x1 + x2) / 2 > group.shape[1] / 2
+
+
+@requires_sample
+def test_verify_candidate_scores_the_matched_candidate_faces_quality(monkeypatch):
+    """`VerifiedCandidate.candidate_face_quality` must reflect real graded
+    quality (resolution/blur/exposure/pose/detection) of the *matched* face,
+    not just a bare detector-confidence number — a sharp, well-lit sample
+    photo should score meaningfully above zero with sensible bands."""
+    import httpx
+
+    from facechain.face.encoder import encode_face, read_image
+    from facechain.models import SearchCandidate
+    from facechain.verification import candidate as candmod
+
+    img = read_image(SAMPLES[0])
+    _, ref_embedding, _ = encode_face(img)
+    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    assert ok
+    data = buf.tobytes()
+
+    def fake_transport(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-type": "image/jpeg"}, content=data)
+
+    def patched_client() -> httpx.Client:
+        return httpx.Client(follow_redirects=False, transport=httpx.MockTransport(fake_transport))
+
+    monkeypatch.setattr(candmod, "_client", patched_client)
+    monkeypatch.setattr(candmod, "safe_url_or_none", lambda u: u)
+
+    cand = SearchCandidate(engine="test", url="https://example.com/photo.jpg", domain="example.com")
+    vc = candmod.verify_candidate(cand, perceptual_hashes(data), ref_embedding)
+
+    assert vc.face_detected
+    assert vc.candidate_face_index != -1
+    assert 0.0 < vc.candidate_face_quality <= 1.0
+    assert vc.candidate_face_bands.get("detection") == "PASS"

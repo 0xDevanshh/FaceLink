@@ -28,3 +28,16 @@ def best_cosine(reference: np.ndarray, candidates: list[np.ndarray]) -> float:
     largest face there.
     """
     return max((cosine(reference, c) for c in candidates), default=0.0)
+
+
+def best_match_index(reference: np.ndarray, candidates: list[np.ndarray]) -> tuple[float, int]:
+    """Like `best_cosine`, but also reports which candidate face won.
+
+    Needed to attach a face index and per-face quality to the evidence for
+    group photos, rather than only ever reporting "some face matched".
+    """
+    if not candidates:
+        return 0.0, -1
+    scores = [cosine(reference, c) for c in candidates]
+    idx = max(range(len(scores)), key=lambda i: scores[i])
+    return scores[idx], idx

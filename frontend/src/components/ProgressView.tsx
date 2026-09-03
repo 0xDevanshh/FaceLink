@@ -58,6 +58,7 @@ function engineChips(events: SSEEvent[]): {
     if (!evt.stage.startsWith('search:')) continue
     const name = evt.stage.slice(7)
     if (name === 'platform') continue // platform tallies are not providers
+    if (name.startsWith('variant:')) continue // extra search-variant passes get their own section
     if (!engines[name]) engines[name] = { status: 'idle', detail: '', providerStatus: '' }
     const e = engines[name]
     if (evt.status === 'start') e.status = 'running'
@@ -73,6 +74,27 @@ function engineChips(events: SSEEvent[]): {
     }
   }
   return Object.entries(engines).map(([name, v]) => ({ name, ...v }))
+}
+
+/**
+ * Search-variant chips — separate from engine chips since a variant pass is a
+ * supplementary search over a crop of the same photo, not another provider.
+ * See `search/variants.py`.
+ */
+function variantChips(events: SSEEvent[]): { name: string; status: StageStatus; detail: string }[] {
+  const variants: Record<string, { status: StageStatus; detail: string }> = {}
+  for (const evt of events) {
+    if (!evt.stage.startsWith('search:variant:')) continue
+    const rest = evt.stage.slice('search:variant:'.length)
+    const variantType = rest.split(':')[0]
+    if (!variants[variantType]) variants[variantType] = { status: 'idle', detail: '' }
+    const v = variants[variantType]
+    if (evt.status === 'start') v.status = 'running'
+    else if (evt.status === 'ok') v.status = 'ok'
+    else if (evt.status === 'fail') v.status = 'fail'
+    if (evt.detail) v.detail = evt.detail
+  }
+  return Object.entries(variants).map(([name, v]) => ({ name, ...v }))
 }
 
 function platformTallies(events: SSEEvent[]): string[] {
@@ -178,6 +200,7 @@ export default function ProgressView({ caseId, events, onEvent, onDone, onFailed
 
   const stageMap = buildStageMap(events)
   const chips = engineChips(events)
+  const variantChipList = variantChips(events)
   const platforms = platformTallies(events)
   const candidates = candidateLines(events)
   const isDone = events.some((e) => e.stage === 'done' || e.stage === 'error')
@@ -268,6 +291,32 @@ export default function ProgressView({ caseId, events, onEvent, onDone, onFailed
                 aria-label={`${chip.name}: ${chip.providerStatus || chip.status}`}
               >
                 {chip.name} · {chip.providerStatus || chip.status}
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {/* Search-variant chips: extra crops re-searched beyond the original
+          upload, budgeted per scan depth — see search/variants.py. */}
+      {variantChipList.length > 0 && (
+        <section className="mb-6" aria-labelledby="variant-status-heading">
+          <h2 id="variant-status-heading" className="text-xs font-semibold text-muted uppercase tracking-wider mb-2">
+            Search Variants
+          </h2>
+          <div className="flex flex-wrap gap-2" role="list" aria-label="Search variant status chips">
+            {variantChipList.map((v) => (
+              <div
+                key={v.name}
+                role="listitem"
+                title={v.detail}
+                className={`px-3 py-1 rounded-full text-xs font-mono border
+                  ${v.status === 'ok' ? 'border-success/60 text-success bg-green-900/10' :
+                    v.status === 'fail' ? 'border-warn/60 text-warn bg-yellow-900/10' :
+                    v.status === 'running' ? 'border-accent/60 text-accent bg-blue-900/10 animate-pulse' :
+                    'border-border text-muted'}`}
+              >
+                {v.name}
               </div>
             ))}
           </div>

@@ -236,6 +236,34 @@ def test_the_quality_report_is_recorded_even_on_a_passing_run():
     assert q.blur_score > 0 and q.face_px > 0
 
 
+def test_every_case_carries_the_threshold_snapshot_that_governed_it():
+    """Even a run that never reaches search (no engines configured) must
+    record which thresholds were in force — a threshold change must be
+    auditable in the evidence, not just in the current config file."""
+    from facechain.config import settings as global_settings
+
+    case = run(opts(ONE_FACE))
+    snap = case.threshold_snapshot
+    assert snap is not None
+    assert snap.face_match_threshold == global_settings.face_match_threshold
+    assert snap.image_match_threshold == global_settings.image_match_threshold
+    assert snap.verify_min_score == global_settings.verify_min_score
+    assert snap.calibration_status == "DEFAULT"
+
+
+def test_a_configured_calibration_file_is_reflected_in_the_snapshot(tmp_path, monkeypatch):
+    import json
+    from facechain.config import settings as global_settings
+
+    calib = tmp_path / "calibration.json"
+    calib.write_text(json.dumps({"status": "CALIBRATED", "note": "60/60 pairs"}))
+    monkeypatch.setattr(global_settings, "calibration_file", str(calib))
+
+    case = run(opts(ONE_FACE))
+    assert case.threshold_snapshot.calibration_status == "CALIBRATED"
+    assert "60/60" in case.threshold_snapshot.calibration_note
+
+
 # ---- the bundle is written on every terminal path -----------------------
 
 @pytest.mark.parametrize("kwargs,expected", [
@@ -261,7 +289,7 @@ def test_a_crop_becomes_the_search_query(tmp_path, monkeypatch):
 
     seen: dict = {}
 
-    def fake_search(image_path, engines=None, image_url=None, on_event=None):
+    def fake_search(image_path, engines=None, image_url=None, on_event=None, variants=None):
         seen["path"] = image_path
         return SearchReport(engines_attempted=list(engines or [])), None
 
@@ -286,7 +314,7 @@ def test_a_face_selection_without_a_crop_searches_the_whole_upload(tmp_path, mon
 
     seen: dict = {}
 
-    def fake_search(image_path, engines=None, image_url=None, on_event=None):
+    def fake_search(image_path, engines=None, image_url=None, on_event=None, variants=None):
         seen["path"] = image_path
         return SearchReport(engines_attempted=list(engines or [])), None
 
@@ -295,3 +323,85 @@ def test_a_face_selection_without_a_crop_searches_the_whole_upload(tmp_path, mon
     path, _ = two_face_photo(tmp_path)
     run(opts(path, face_index=1, selection_mode="manual-face"))
     assert seen["path"] == str(path)
+
+
+def test_the_download_budget_guard_uses_real_bytes_not_an_estimate(tmp_path, monkeypatch):
+    """Regression: the guard used to estimate `downloads * 500_000` bytes
+    instead of summing what verification actually downloaded, so it could
+    keep running well past the real 50MB ceiling (or stop early for small
+    images). It must react to `MediaCache.total_bytes` directly."""
+    from facechain import runner as runner_mod
+    from facechain.models import SearchCandidate, SearchReport
+
+    monkeypatch.setattr(runner_mod, "MAX_DOWNLOAD_BYTES", 10_000_000)  # 10MB for this test
+
+    candidates = [
+        SearchCandidate(engine="test", url=f"https://example.com/{i}", domain="example.com")
+        for i in range(5)
+    ]
+
+    def fake_search(image_path, engines=None, image_url=None, on_event=None, variants=None):
+        return SearchReport(engines_attempted=list(engines or []), candidates=candidates,
+                            total_candidates=len(candidates)), None
+
+    calls: list[int] = []
+
+    def fake_verify_candidate(cand, input_hashes, input_embedding, cache=None):
+        calls.append(1)
+        # Each call "downloads" 6MB — the second call should push the running
+        # total past the 10MB budget and stop a third call from happening.
+        cache.total_bytes += 6_000_000
+        from facechain.models import VerifiedCandidate
+        return VerifiedCandidate(engine=cand.engine, url=cand.url, domain=cand.domain,
+                                 canonical_url=cand.url)
+
+    monkeypatch.setattr(runner_mod, "run_reverse_search", fake_search)
+    monkeypatch.setattr(runner_mod, "verify_candidate", fake_verify_candidate)
+
+    run(opts(ONE_FACE))
+
+    # First call: 0MB -> proceeds, ends at 6MB. Second call: 6MB -> proceeds
+    # (under budget when checked), ends at 12MB. Third call: 12MB >= 10MB ->
+    # stops before verifying candidate 3, 4, or 5.
+    assert len(calls) == 2
+
+
+def test_the_case_carries_an_evidence_graph_with_independent_sources(tmp_path, monkeypatch):
+    """End-to-end: two verified hits on different platforms/domains should
+    show up in `case.evidence_graph` as an independent_source relationship,
+    not just as two rows in the candidate list."""
+    from facechain import runner as runner_mod
+    from facechain.models import SearchCandidate, SearchReport, VerifiedCandidate
+
+    candidates = [
+        SearchCandidate(engine="test", url="https://linkedin.com/in/alice",
+                        domain="linkedin.com", platform="LinkedIn", is_social=True),
+        SearchCandidate(engine="test", url="https://github.com/alice",
+                        domain="github.com", platform="GitHub", is_social=True),
+    ]
+
+    def fake_search(image_path, engines=None, image_url=None, on_event=None, variants=None):
+        return SearchReport(engines_attempted=list(engines or []), candidates=candidates,
+                            total_candidates=len(candidates)), None
+
+    def fake_verify_candidate(cand, input_hashes, input_embedding, cache=None):
+        # score_candidate() recomputes verified/final_score/stages from these
+        # measurements — face+image similarity here are high enough to clear
+        # verify_min_score (0.70) once weighted, so both genuinely verify.
+        return VerifiedCandidate(
+            engine=cand.engine, url=cand.url, domain=cand.domain, platform=cand.platform,
+            is_social=True, canonical_url=cand.url,
+            candidate_image_phash="0011" if "linkedin" in cand.url else "ff00",
+            face_detected=True, face_similarity=0.95, image_similarity=0.6,
+        )
+
+    monkeypatch.setattr(runner_mod, "run_reverse_search", fake_search)
+    monkeypatch.setattr(runner_mod, "verify_candidate", fake_verify_candidate)
+
+    case = run(opts(ONE_FACE))
+
+    assert case.evidence_graph is not None
+    assert case.evidence_graph.independent_evidence_count == 2
+    assert any(e.type == "independent_source" for e in case.evidence_graph.edges)
+    assert any(n.type == "domain" and n.label == "linkedin.com" for n in case.evidence_graph.nodes)
+    assert any(n.type == "domain" and n.label == "github.com" for n in case.evidence_graph.nodes)

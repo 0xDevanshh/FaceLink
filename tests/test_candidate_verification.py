@@ -278,6 +278,47 @@ def test_the_cache_is_bounded():
     assert cache._max_entries == 2
 
 
+def test_total_bytes_counts_the_page_and_the_image(stub_http):
+    """Regression: the download-budget guard in `runner.py` used to estimate
+    bytes as `downloads * 500_000` rather than summing what was actually
+    fetched. `total_bytes` must reflect real page + image bytes."""
+    data = png_bytes()
+    page_html = html_page(
+        '<meta property="og:image" content="https://cdn.example.com/shared.png">')
+    stub_http["https://a.example/page"] = page_html
+    stub_http["https://cdn.example.com/shared.png"] = image_response(data)
+
+    cache = MediaCache()
+    verify_candidate(candidate("https://a.example/page"), perceptual_hashes(data),
+                     embedding(), cache)
+
+    assert cache.total_bytes == len(page_html.content) + len(data)
+
+
+def test_total_bytes_keeps_counting_once_the_cache_store_is_full(stub_http):
+    """`_bytes` (the bounded in-memory store) stops growing once the cache is
+    full; `total_bytes` must not silently freeze with it — a scan that keeps
+    downloading past the cache's capacity is still spending real bandwidth."""
+    cache = MediaCache(max_entries=1, max_bytes=1)
+    images = [png_bytes(colour=c) for c in ((10, 10, 10), (120, 120, 120), (230, 230, 230))]
+    for i, data in enumerate(images):
+        url = f"https://cdn.example.com/img{i}.png"
+        stub_http[f"https://site{i}.example/page"] = html_page(
+            f'<meta property="og:image" content="{url}">')
+        stub_http[url] = image_response(data)
+
+    for i, data in enumerate(images):
+        verify_candidate(candidate(f"https://site{i}.example/page"),
+                         perceptual_hashes(data), embedding(), cache)
+
+    assert cache.downloads == 3
+    # The bounded store can only hold the first entry...
+    assert len(cache._store) == 1
+    # ...but total_bytes reflects every download, not just what was retained.
+    total_image_bytes = sum(len(d) for d in images)
+    assert cache.total_bytes >= total_image_bytes
+
+
 # ---- exact-image vs same-face ------------------------------------------
 
 def _measured(**kw) -> VerifiedCandidate:

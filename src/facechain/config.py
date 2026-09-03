@@ -255,6 +255,13 @@ class Settings(BaseSettings):
     weight_meta: float = 0.10
     verify_min_score: float = 0.70
     max_candidates_to_verify: int = 12
+    # Optional: path to a `CalibrationResult` JSON written by
+    # `facechain.benchmark`. When set and its status is "CALIBRATED", every
+    # case's `threshold_snapshot` records that instead of the honest default
+    # "DEFAULT / not calibrated" state. Never changes `face_match_threshold`
+    # itself — calibration only annotates the evidence, it does not silently
+    # rewrite the operating point a human configured.
+    calibration_file: str = ""
     http_timeout_s: int = 25
     user_agent: str = (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -273,6 +280,19 @@ class Settings(BaseSettings):
     max_image_edge: int = 8000
     # What to do when multiple faces are detected: reject | largest | all
     multi_face_policy: Literal["reject", "largest", "all"] = "largest"
+
+    # ---- graded quality bands (informational, not hard gates) ------------
+    # These score the passing image on a continuum so downstream stages
+    # (ranking, confidence, "insufficient evidence" messaging) can react to
+    # *how* good a passing face is, not just pass/fail. They never reject on
+    # their own — `gate()`'s hard checks above still own that.
+    quality_good_face_px: int = 160
+    quality_good_blur: float = 80.0
+    quality_good_det_score: float = 0.80
+    quality_acceptable_det_score: float = 0.60
+    quality_good_pose_deg: float = 15.0
+    quality_acceptable_pose_deg: float = 30.0
+    quality_brightness_margin: float = 25.0  # distance from min/max edge counted "GOOD"
 
     # ---- API keys for Tier-1 / Tier-2 search ----------------------------
     facecheck_api_key: str = ""

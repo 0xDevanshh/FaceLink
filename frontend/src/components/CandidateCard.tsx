@@ -1,5 +1,5 @@
 import React from 'react'
-import type { VerifiedCandidate } from '../types/api'
+import type { ThresholdSnapshot, VerifiedCandidate } from '../types/api'
 
 const LADDER = ['SEARCH_FOUND', 'SOCIAL_MATCH', 'IMAGE_MATCH', 'FACE_MATCH', 'VERIFIED']
 
@@ -54,12 +54,21 @@ const BAND_STYLE: Record<string, string> = {
 interface Props {
   candidate: VerifiedCandidate
   rank?: number
+  thresholds?: ThresholdSnapshot | null
 }
 
-export default function CandidateCard({ candidate: c, rank }: Props) {
+// Fallback only for a case with no recorded threshold_snapshot (should not
+// happen for a scan run after this was added, but an older evidence bundle
+// loaded independently could lack it).
+const FALLBACK_FACE_THRESHOLD = 0.38
+const FALLBACK_IMAGE_THRESHOLD = 0.80
+
+export default function CandidateCard({ candidate: c, rank, thresholds }: Props) {
   const isVerified = c.verified
   const icon = c.platform ? (PLATFORM_ICONS[c.platform] ?? '🌐') : '🌐'
   const bandStyle = BAND_STYLE[c.confidence_band] ?? BAND_STYLE.INSUFFICIENT
+  const faceThreshold = thresholds?.face_match_threshold ?? FALLBACK_FACE_THRESHOLD
+  const imageThreshold = thresholds?.image_match_threshold ?? FALLBACK_IMAGE_THRESHOLD
 
   return (
     <article
@@ -122,8 +131,8 @@ export default function CandidateCard({ candidate: c, rank }: Props) {
 
       {/* Score bars */}
       <div className="grid grid-cols-3 gap-3 mb-3 text-xs">
-        <ScoreBar label="Face sim" value={c.face_similarity} threshold={0.38} />
-        <ScoreBar label="Image sim" value={c.image_similarity} threshold={0.80} />
+        <ScoreBar label="Face sim" value={c.face_similarity} threshold={faceThreshold} />
+        <ScoreBar label="Image sim" value={c.image_similarity} threshold={imageThreshold} />
         <ScoreBar label="Metadata" value={c.metadata_consistency} />
       </div>
 
@@ -180,7 +189,20 @@ export default function CandidateCard({ candidate: c, rank }: Props) {
           <span>match: <span className={c.match_type === 'exact-image' ? 'text-success' : 'text-warn'}>{c.match_type}</span></span>
         )}
         {c.candidate_faces_found > 0 && (
-          <span>{c.candidate_faces_found} face(s) in candidate</span>
+          <span>
+            {c.candidate_faces_found} face(s) in candidate
+            {c.candidate_faces_found > 1 && c.candidate_face_index >= 0 && (
+              <> — matched face #{c.candidate_face_index + 1}</>
+            )}
+          </span>
+        )}
+        {c.candidate_face_index >= 0 && (
+          <span>
+            candidate face quality:{' '}
+            <span className={c.candidate_face_quality >= 0.6 ? 'text-success' : 'text-warn'}>
+              {Math.round(c.candidate_face_quality * 100)}%
+            </span>
+          </span>
         )}
       </div>
 
@@ -208,11 +230,12 @@ function ScoreBar({ label, value, threshold }: { label: string; value: number; t
         <span className="font-mono text-gray-300">{Math.round(pct * 100)}%</span>
       </div>
       <div className="relative h-1.5 bg-surface rounded-full overflow-hidden">
-        {threshPct && (
+        {threshPct !== undefined && (
           <div
             className="absolute top-0 bottom-0 w-px bg-warn/60 z-10"
             style={{ left: `${threshPct}%` }}
             aria-hidden
+            data-testid={`threshold-marker-${label}`}
           />
         )}
         <div

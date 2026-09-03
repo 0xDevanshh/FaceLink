@@ -32,7 +32,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from typing import Callable
 
 from ..config import OTHER_WEB_PRIORITY, PLATFORM_PRIORITY, settings
-from ..models import ProviderReport, ProviderStatus, SearchCandidate, SearchReport
+from ..models import ProviderReport, ProviderStatus, SearchCandidate, SearchReport, SearchVariantReport
 from .base import EngineResult, looks_like_post
 from .bing import BingVisualAdapter
 from .browser import BrowserSession
@@ -40,6 +40,7 @@ from .google_lens import GoogleLensAdapter
 from .serpapi import SerpApiAdapter
 from .tineye import TinEyeAdapter
 from .uploader import UploadError, publish_temporarily
+from .variants import SearchVariant
 from .yandex import YandexAdapter
 
 log = logging.getLogger(__name__)
@@ -119,11 +120,146 @@ def _run_api_engine(name: str, image_path: str, public_url: str | None) -> Engin
     return API_ADAPTERS[name]().search(image_path, public_url)
 
 
+def _run_engine_pass(
+    image_path: str,
+    engines: list[str],
+    public_url: str | None,
+    stage_deadline: float,
+    emit: Callable[[str, str, str], None],
+    emit_prefix: str = "",
+) -> tuple[list[EngineResult], list[ProviderReport], bool]:
+    """Fan `image_path` out across `engines` once, bounded by `stage_deadline`.
+
+    Shared by the primary (original-image) pass and every extra search-variant
+    pass, so a variant gets the exact same isolation/timeout/concurrency
+    guarantees as the main search rather than a cheaper approximation of them.
+    """
+
+    def tag(engine: str) -> str:
+        return f"{emit_prefix}{engine}" if emit_prefix else engine
+
+    planned: list[tuple[str, Callable[[], EngineResult]]] = []
+    providers: list[ProviderReport] = []
+    for name in engines:
+        if name in BROWSER_ADAPTERS:
+            planned.append((name, lambda n=name: _run_browser_engine(n, image_path, public_url)))
+        elif name in API_ADAPTERS:
+            planned.append((name, lambda n=name: _run_api_engine(n, image_path, public_url)))
+        else:
+            providers.append(ProviderReport(
+                engine=name, status=ProviderStatus.FAILED, error="unknown engine"))
+            emit(tag(name), "fail", "FAILED: unknown engine")
+
+    results: list[EngineResult] = []
+    timed_out = False
+    if not planned:
+        return results, providers, timed_out
+
+    remaining_budget = stage_deadline - time.monotonic()
+    if remaining_budget <= 0:
+        for name, _ in planned:
+            providers.append(ProviderReport(
+                engine=name, status=ProviderStatus.TIMEOUT,
+                error="search budget exhausted before this pass could start"))
+            emit(tag(name), "fail", f"{ProviderStatus.TIMEOUT.value}: search budget exhausted")
+        return results, providers, True
+
+    workers = max(1, min(settings.search_concurrency, len(planned)))
+    started_at: dict[str, float] = {}
+
+    def timed(name: str, fn: Callable[[], EngineResult]) -> EngineResult:
+        started_at[name] = time.monotonic()
+        emit(tag(name), "start", "")
+        return fn()
+
+    # NOT a `with` block, deliberately. ThreadPoolExecutor.__exit__ calls
+    # shutdown(wait=True), which joins every running worker — so a wedged
+    # provider would be waited on anyway and the deadline below would do
+    # nothing. Owning the shutdown explicitly is what makes abandonment real.
+    pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="search")
+    try:
+        futures = {}
+        for name, fn in planned:
+            started_at[name] = time.monotonic()
+            futures[pool.submit(timed, name, fn)] = name
+
+        pending = set(futures)
+        while pending:
+            remaining = stage_deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            done, pending = wait(pending, timeout=remaining, return_when=FIRST_COMPLETED)
+            for fut in done:
+                name = futures[fut]
+                elapsed = time.monotonic() - started_at[name]
+                try:
+                    res = fut.result()
+                except Exception as exc:  # noqa: BLE001 - isolation is the point
+                    log.warning("provider %s raised: %s", name, exc)
+                    res = EngineResult(name, ok=False,
+                                       error=f"{type(exc).__name__}: {str(exc)[:200]}")
+                status = _status_for(res)
+                # A provider that used its whole budget and still failed is
+                # a timeout, whatever the adapter called it.
+                if not res.ok and elapsed >= settings.engine_timeout_s:
+                    status = ProviderStatus.TIMEOUT
+                results.append(res)
+                providers.append(ProviderReport(
+                    engine=res.engine or name,
+                    status=status,
+                    candidates=len(res.candidates),
+                    duration_s=elapsed,
+                    query_mode=res.query_mode,
+                    error="" if status.produced_results else res.error[:300],
+                ))
+                detail = (f"{status.value}: {len(res.candidates)} candidates"
+                          if status.produced_results
+                          else f"{status.value}: {res.error[:160]}")
+                emit(tag(name), "ok" if status.produced_results else "fail", detail)
+
+        # Anything still pending blew the stage budget. Those workers are
+        # abandoned rather than joined: Playwright's own per-operation
+        # timeouts guarantee they eventually unwind and close their browser,
+        # so the scan is never held hostage by a wedged provider.
+        for fut in pending:
+            name = futures[fut]
+            fut.cancel()
+            timed_out = True
+            providers.append(ProviderReport(
+                engine=name,
+                status=ProviderStatus.TIMEOUT,
+                duration_s=time.monotonic() - started_at[name],
+                error="exceeded the search budget",
+            ))
+            emit(tag(name), "fail", f"{ProviderStatus.TIMEOUT.value}: search budget exhausted")
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+    return results, providers, timed_out
+
+
+def _merge_candidates(
+    merged: dict[str, SearchCandidate], results: list[EngineResult], variant_id: str = ""
+) -> None:
+    for res in results:
+        for cand in res.candidates:
+            key = cand.url.split("#")[0].rstrip("/")
+            existing = merged.get(key)
+            if existing is None:
+                if variant_id:
+                    cand.found_via_variant = variant_id
+                merged[key] = cand
+            elif res.engine not in existing.engine:
+                # Corroboration across engines is a positive signal; keep both names.
+                existing.engine = f"{existing.engine}+{res.engine}"
+
+
 def run_reverse_search(
     image_path: str,
     engines: list[str] | None = None,
     image_url: str | None = None,
     on_event: Callable[[str, str, str], None] | None = None,
+    variants: list[SearchVariant] | None = None,
 ) -> tuple[SearchReport, str | None]:
     """Search `image_path` on every requested engine.
 
@@ -131,6 +267,15 @@ def run_reverse_search(
     is one of "start" | "ok" | "fail". The detail string always names the
     provider's terminal state, so a UI can show CHALLENGED and TIMEOUT as the
     distinct outcomes they are.
+
+    `variants` (see `search/variants.py`) optionally adds extra search passes
+    over crops of the same photo, on top of the pass over `image_path` this
+    function has always done. Each variant gets a share of the overall search
+    budget; its own engine-level events do not overwrite the primary pass's
+    `report.providers`, since that remains the historical single-search view
+    every existing consumer (CLI, UI, evidence) already expects. Extra
+    variants are attributed instead through `report.variants` and
+    `SearchCandidate.found_via_variant`.
 
     Returns the merged report and the public image URL actually used (if any).
     """
@@ -149,97 +294,61 @@ def run_reverse_search(
             log.warning("temp hosting failed, falling back to upload flows: %s", exc)
             emit("host", "fail", str(exc))
 
-    # ---- plan ------------------------------------------------------------
-    planned: list[tuple[str, Callable[[], EngineResult]]] = []
-    for name in engines:
-        if name in BROWSER_ADAPTERS:
-            planned.append((name, lambda n=name: _run_browser_engine(n, image_path, public_url)))
-        elif name in API_ADAPTERS:
-            planned.append((name, lambda n=name: _run_api_engine(n, image_path, public_url)))
-        else:
-            report.providers.append(ProviderReport(
-                engine=name, status=ProviderStatus.FAILED, error="unknown engine"))
-            emit(name, "fail", "FAILED: unknown engine")
+    extra_variants = [v for v in (variants or []) if v.image_path != image_path]
+    n_passes = 1 + len(extra_variants)
+    total_budget = settings.search_total_timeout_s
+    # Each pass gets an even share of the overall budget rather than the full
+    # budget each — otherwise the second variant could never run at all once
+    # the first pass had already used its wall-clock allowance.
+    per_pass_budget = total_budget / n_passes if n_passes > 1 else total_budget
+    now = time.monotonic()
 
-    results: list[EngineResult] = []
+    # ---- primary pass: the image already chosen upstream (crop or upload) ---
+    primary_deadline = now + per_pass_budget
+    results, providers, timed_out = _run_engine_pass(
+        image_path, engines, public_url, primary_deadline, emit
+    )
+    report.providers = providers
+    report.timed_out = timed_out
 
-    if planned:
-        stage_deadline = time.monotonic() + settings.search_total_timeout_s
-        workers = max(1, min(settings.search_concurrency, len(planned)))
-        started_at: dict[str, float] = {}
-
-        def timed(name: str, fn: Callable[[], EngineResult]) -> EngineResult:
-            # Start time is taken inside the task, so a provider that waited for
-            # a free worker is not charged for the queueing.
-            started_at[name] = time.monotonic()
-            emit(name, "start", "")
-            return fn()
-
-        # NOT a `with` block, deliberately. ThreadPoolExecutor.__exit__ calls
-        # shutdown(wait=True), which joins every running worker — so a wedged
-        # provider would be waited on anyway and the deadline below would do
-        # nothing. Owning the shutdown explicitly is what makes abandonment real.
-        pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="search")
-        try:
-            futures = {}
-            for name, fn in planned:
-                started_at[name] = time.monotonic()
-                futures[pool.submit(timed, name, fn)] = name
-
-            pending = set(futures)
-            while pending:
-                remaining = stage_deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                done, pending = wait(pending, timeout=remaining, return_when=FIRST_COMPLETED)
-                for fut in done:
-                    name = futures[fut]
-                    elapsed = time.monotonic() - started_at[name]
-                    try:
-                        res = fut.result()
-                    except Exception as exc:  # noqa: BLE001 - isolation is the point
-                        log.warning("provider %s raised: %s", name, exc)
-                        res = EngineResult(name, ok=False,
-                                           error=f"{type(exc).__name__}: {str(exc)[:200]}")
-                    status = _status_for(res)
-                    # A provider that used its whole budget and still failed is
-                    # a timeout, whatever the adapter called it.
-                    if not res.ok and elapsed >= settings.engine_timeout_s:
-                        status = ProviderStatus.TIMEOUT
-                    results.append(res)
-                    report.providers.append(ProviderReport(
-                        engine=res.engine or name,
-                        status=status,
-                        candidates=len(res.candidates),
-                        duration_s=elapsed,
-                        query_mode=res.query_mode,
-                        error="" if status.produced_results else res.error[:300],
-                    ))
-                    detail = (f"{status.value}: {len(res.candidates)} candidates"
-                              if status.produced_results
-                              else f"{status.value}: {res.error[:160]}")
-                    emit(name, "ok" if status.produced_results else "fail", detail)
-
-            # Anything still pending blew the stage budget. Those workers are
-            # abandoned rather than joined: Playwright's own per-operation
-            # timeouts guarantee they eventually unwind and close their browser,
-            # so the scan is never held hostage by a wedged provider.
-            for fut in pending:
-                name = futures[fut]
-                fut.cancel()
-                report.timed_out = True
-                report.providers.append(ProviderReport(
-                    engine=name,
-                    status=ProviderStatus.TIMEOUT,
-                    duration_s=time.monotonic() - started_at[name],
-                    error=f"exceeded the {settings.search_total_timeout_s}s search budget",
-                ))
-                emit(name, "fail", f"{ProviderStatus.TIMEOUT.value}: search budget exhausted")
-        finally:
-            pool.shutdown(wait=False, cancel_futures=True)
-
-    # ---- merge -----------------------------------------------------------
     merged: dict[str, SearchCandidate] = {}
+    _merge_candidates(merged, results)
+
+    if extra_variants:
+        report.variants.append(SearchVariantReport(
+            variant_id="v0-original", variant_type="original",
+            sha256="", candidates_found=len(merged),
+        ))
+
+    # ---- extra variant passes -----------------------------------------------
+    overall_deadline = now + total_budget
+    for variant in extra_variants:
+        pass_deadline = min(time.monotonic() + per_pass_budget, overall_deadline)
+        if time.monotonic() >= overall_deadline:
+            report.variants.append(SearchVariantReport(
+                variant_id=variant.variant_id, variant_type=variant.variant_type,
+                sha256=variant.sha256, width=variant.width, height=variant.height,
+                skipped=True, skip_reason="overall search budget exhausted",
+            ))
+            continue
+
+        emit(f"search:variant:{variant.variant_type}", "start", variant.variant_id)
+        v_results, _v_providers, v_timed_out = _run_engine_pass(
+            variant.image_path, engines, public_url, pass_deadline, emit,
+            emit_prefix=f"variant:{variant.variant_type}:",
+        )
+        report.timed_out = report.timed_out or v_timed_out
+        before = len(merged)
+        _merge_candidates(merged, v_results, variant_id=variant.variant_id)
+        new_hits = len(merged) - before
+        report.variants.append(SearchVariantReport(
+            variant_id=variant.variant_id, variant_type=variant.variant_type,
+            sha256=variant.sha256, width=variant.width, height=variant.height,
+            candidates_found=new_hits,
+        ))
+        emit(f"search:variant:{variant.variant_type}", "ok" if not v_timed_out else "fail",
+             f"{new_hits} new candidate(s)")
+
     for res in results:
         report.query_mode[res.engine] = res.query_mode
         provider = report.provider(res.engine)
@@ -247,14 +356,6 @@ def run_reverse_search(
             report.engines_succeeded.append(res.engine)
         elif provider is not None and provider.error:
             report.engine_errors[res.engine] = provider.error
-        for cand in res.candidates:
-            key = cand.url.split("#")[0].rstrip("/")
-            existing = merged.get(key)
-            if existing is None:
-                merged[key] = cand
-            elif res.engine not in existing.engine:
-                # Corroboration across engines is a positive signal; keep both names.
-                existing.engine = f"{existing.engine}+{res.engine}"
 
     # Priority platforms first, a specific post ahead of a bare profile, then
     # the wider web. Ordering only — verification decides what is true.

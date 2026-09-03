@@ -195,6 +195,12 @@ def gate_selected(image_bgr: np.ndarray, faces: list[DetectedFace], face_index: 
         blur_score=report.blur_score,
         face_px=report.face_px,
         face_count=len(faces),
+        det_score=report.det_score,
+        yaw_deg=report.yaw_deg,
+        roll_deg=report.roll_deg,
+        brightness=report.brightness,
+        bands=report.bands,
+        overall_quality=report.overall_quality,
     )
 
 

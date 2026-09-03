@@ -49,10 +49,13 @@ const MOCK_RESULT: CaseResult = {
     ],
     platform_counts: { LinkedIn: 0, Instagram: 2, 'X/Twitter': 0, GitHub: 0, YouTube: 0, 'Other Web': 3 },
     timed_out: false,
+    variants: [],
   },
   verification: [],
   best_match: null,
   stages_passed: ['SEARCH_FOUND', 'SOCIAL_MATCH'],
+  evidence_graph: null,
+  threshold_snapshot: null,
   blockchain: null,
 }
 
@@ -78,6 +81,29 @@ describe('EvidenceView', () => {
     expect(screen.getAllByText('case.json').length).toBeGreaterThan(0)
     expect(screen.getAllByText('attested_payload.json').length).toBeGreaterThan(0)
     expect(screen.getAllByText('blockchain.json').length).toBeGreaterThan(0)
+  })
+
+  it('lists the newer evidence_graph.json and threshold_snapshot.json files', () => {
+    render(<EvidenceView caseId="case_20260901_000000" result={MOCK_RESULT} />)
+    expect(screen.getAllByText('evidence_graph.json').length).toBeGreaterThan(0)
+    expect(screen.getAllByText('threshold_snapshot.json').length).toBeGreaterThan(0)
+  })
+
+  it('expands threshold_snapshot.json to show the recorded calibration status', async () => {
+    const result = {
+      ...MOCK_RESULT,
+      threshold_snapshot: {
+        face_match_threshold: 0.38, image_match_threshold: 0.80, verify_min_score: 0.70,
+        weight_face: 0.5, weight_image: 0.4, weight_meta: 0.1,
+        insightface_model: 'buffalo_l', face_backend: 'insightface',
+        calibration_status: 'CALIBRATED', calibration_note: '60/60 pairs',
+      },
+    }
+    render(<EvidenceView caseId="case_20260901_000000" result={result} />)
+    fireEvent.click(screen.getByRole('button', { name: /threshold_snapshot\.json/i }))
+    await waitFor(() => {
+      expect(screen.getByText(/CALIBRATED/)).toBeInTheDocument()
+    })
   })
 
   it('expands file content on click', async () => {

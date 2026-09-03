@@ -96,6 +96,121 @@ class TestRunBenchmark:
         assert rc == 0
 
 
+class TestCalibrate:
+    def test_below_min_pairs_is_reported_as_insufficient(self):
+        from facechain.benchmark import calibrate
+
+        result = calibrate(genuine_scores=[0.9, 0.85], impostor_scores=[0.1, 0.15],
+                           min_pairs=50, default_threshold=0.38)
+        assert result.status == "CALIBRATION_INSUFFICIENT"
+        assert result.suggested_threshold == 0.38  # falls back to the default, not a guess
+        assert "50" in result.note
+
+    def test_at_or_above_min_pairs_is_calibrated(self):
+        from facechain.benchmark import calibrate
+
+        genuine = [0.85] * 10  # 10 * 10 impostor => enough pairs at min_pairs=10
+        impostor = [0.10] * 10
+        result = calibrate(genuine, impostor, min_pairs=10, default_threshold=0.38)
+        assert result.status == "CALIBRATED"
+
+    def test_well_separated_distributions_find_a_threshold_between_them(self):
+        from facechain.benchmark import calibrate
+
+        genuine = [0.90] * 60
+        impostor = [0.10] * 60
+        result = calibrate(genuine, impostor, min_pairs=50)
+        assert result.status == "CALIBRATED"
+        assert 0.10 < result.suggested_threshold < 0.90
+        assert result.far_at_suggested_pct == pytest.approx(0.0)
+        assert result.frr_at_suggested_pct == pytest.approx(0.0)
+
+    def test_sweep_covers_the_documented_threshold_range(self):
+        from facechain.benchmark import calibrate
+
+        result = calibrate([0.8] * 55, [0.2] * 55, min_pairs=50)
+        thresholds = [row.threshold for row in result.sweep]
+        assert min(thresholds) == pytest.approx(0.20)
+        assert max(thresholds) == pytest.approx(0.95)
+
+    def test_empty_inputs_are_insufficient_not_a_crash(self):
+        from facechain.benchmark import calibrate
+
+        result = calibrate([], [], min_pairs=50)
+        assert result.status == "CALIBRATION_INSUFFICIENT"
+        assert result.n_genuine_pairs == 0
+        assert result.n_impostor_pairs == 0
+
+    def test_insufficient_status_still_returns_a_full_sweep(self):
+        """The sweep table is still informative even when the verdict is
+        insufficient — only the *recommendation* is withheld."""
+        from facechain.benchmark import calibrate
+
+        result = calibrate([0.9], [0.1], min_pairs=50)
+        assert result.status == "CALIBRATION_INSUFFICIENT"
+        assert len(result.sweep) == 16  # 0.20 .. 0.95 in 0.05 steps
+
+
+class TestRunBenchmarkCalibrationStatus:
+    def test_small_sample_reports_calibration_insufficient(self, patch_embed, tmp_path, capsys):
+        from facechain.benchmark import run_benchmark
+        imgs = []
+        for i in range(4):
+            p = tmp_path / f"img{i}.jpg"; p.write_bytes(b"x" * (i + 1))
+            imgs.append(str(p))
+
+        rc = run_benchmark(imgs[:2], imgs[2:])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "CALIBRATION_INSUFFICIENT" in out
+
+
+class TestLoadCalibrationStatus:
+    def test_no_path_returns_default(self):
+        from facechain.benchmark import load_calibration_status
+        status, note = load_calibration_status("")
+        assert status == "DEFAULT"
+        assert "default" in note.lower()
+
+    def test_missing_file_falls_back_to_default_not_a_crash(self, tmp_path):
+        from facechain.benchmark import load_calibration_status
+        status, note = load_calibration_status(str(tmp_path / "does_not_exist.json"))
+        assert status == "DEFAULT"
+        assert "unreadable" in note.lower()
+
+    def test_malformed_json_falls_back_to_default_not_a_crash(self, tmp_path):
+        from facechain.benchmark import load_calibration_status
+        p = tmp_path / "bad.json"
+        p.write_text("{not valid json")
+        status, note = load_calibration_status(str(p))
+        assert status == "DEFAULT"
+
+    def test_a_valid_calibrated_file_is_read_through(self, tmp_path):
+        from facechain.benchmark import load_calibration_status
+        import json
+        p = tmp_path / "calibration.json"
+        p.write_text(json.dumps({"status": "CALIBRATED", "note": "60 genuine / 60 impostor pairs"}))
+        status, note = load_calibration_status(str(p))
+        assert status == "CALIBRATED"
+        assert "60" in note
+
+    def test_run_benchmark_out_writes_a_loadable_calibration_file(self, patch_embed, tmp_path):
+        from facechain.benchmark import run_benchmark, load_calibration_status
+        imgs = []
+        for i in range(4):
+            p = tmp_path / f"img{i}.jpg"; p.write_bytes(b"x" * (i + 1))
+            imgs.append(str(p))
+        out = tmp_path / "calibration.json"
+
+        rc = run_benchmark(imgs[:2], imgs[2:], out_path=str(out))
+        assert rc == 0
+        assert out.exists()
+        status, _note = load_calibration_status(str(out))
+        # 1 genuine pair / 1 impostor-cross-pair set is below min_pairs, so the
+        # round trip must faithfully report insufficiency, not silently upgrade it.
+        assert status == "CALIBRATION_INSUFFICIENT"
+
+
 class TestPairwiseStats:
     def test_empty_returns_none_mean(self):
         from facechain.benchmark import _stats
