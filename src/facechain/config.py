@@ -254,6 +254,23 @@ class Settings(BaseSettings):
     weight_image: float = 0.40
     weight_meta: float = 0.10
     verify_min_score: float = 0.70
+    # Candidates at or above this face similarity are promoted to a priority
+    # ranking group ahead of everything else verified — a ranking rule only,
+    # independent of `face_match_threshold` (0.38, which decides whether a
+    # candidate can verify at all) and `final_score` (which stays the
+    # deciding number for ties, not for group membership).
+    high_face_similarity_priority: float = 0.75
+    # Off by default: normally a candidate needs `final_score >= verify_min_score`
+    # (face + image + metadata combined) to verify. Enabling this adds a second,
+    # independent path — face similarity alone, ignoring image/metadata — for a
+    # deployment that has decided the combined-score gate is rejecting genuine
+    # face matches whose retrieved image just happens to differ a lot (a
+    # different photo, heavy cropping/filters, a stale/low-quality repost).
+    # This is a real accuracy tradeoff: it raises the false-accept rate,
+    # since a strong face match on an unrelated/miscropped image now verifies
+    # on its own. Not a "fix" for a formula bug — a deliberate policy choice.
+    face_only_verify_enabled: bool = False
+    face_only_verify_threshold: float = 0.50
     max_candidates_to_verify: int = 12
     # Optional: path to a `CalibrationResult` JSON written by
     # `facechain.benchmark`. When set and its status is "CALIBRATED", every

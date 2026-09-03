@@ -104,6 +104,52 @@ def test_edited_repost_verifies_as_face_only():
     assert Stage.FACE_MATCH in vc.stages
 
 
+# ---- face_only_verify_enabled: opt-in face-similarity-alone acceptance ----
+
+def test_disabled_by_default_a_strong_face_with_weak_image_still_fails():
+    """Regression guard: this path must be off unless explicitly enabled."""
+    assert not settings.face_only_verify_enabled
+    vc = score_candidate(make(face_similarity=0.75, image_similarity=0.05,
+                              metadata_consistency=0.0))
+    assert not vc.verified
+
+
+def test_enabled_a_strong_face_alone_verifies_despite_weak_image_and_metadata(monkeypatch):
+    monkeypatch.setattr(settings, "face_only_verify_enabled", True)
+    monkeypatch.setattr(settings, "face_only_verify_threshold", 0.50)
+    vc = score_candidate(make(face_similarity=0.75, image_similarity=0.05,
+                              metadata_consistency=0.0))
+    assert vc.verified
+    assert Stage.VERIFIED in vc.stages
+
+
+def test_enabled_but_below_the_face_only_threshold_still_fails(monkeypatch):
+    monkeypatch.setattr(settings, "face_only_verify_enabled", True)
+    monkeypatch.setattr(settings, "face_only_verify_threshold", 0.50)
+    vc = score_candidate(make(face_similarity=0.49, image_similarity=0.05,
+                              metadata_consistency=0.0))
+    assert not vc.verified
+
+
+def test_enabled_still_requires_a_real_face_match_not_just_a_face_similarity_number(monkeypatch):
+    """face_only_ok requires `face_ok` (face_detected AND >= face_match_threshold)
+    — this path can never verify a candidate whose face didn't match at all,
+    regardless of the face_only threshold."""
+    monkeypatch.setattr(settings, "face_only_verify_enabled", True)
+    monkeypatch.setattr(settings, "face_only_verify_threshold", 0.50)
+    vc = score_candidate(make(face_similarity=0.60, face_detected=False,
+                              image_similarity=0.05, metadata_consistency=0.0))
+    assert not vc.verified
+
+
+def test_enabled_does_not_change_the_final_score_formula(monkeypatch):
+    """Additive only — the score itself, and the combined-score path, are
+    both unaffected by this flag."""
+    monkeypatch.setattr(settings, "face_only_verify_enabled", True)
+    vc = score_candidate(make(face_similarity=0.91, image_similarity=0.50, metadata_consistency=0.5))
+    assert vc.final_score == pytest.approx(0.5 * 0.91 + 0.4 * 0.50 + 0.1 * 0.5)
+
+
 def test_face_just_below_threshold_fails():
     vc = score_candidate(make(face_similarity=settings.face_match_threshold - 0.01,
                               image_similarity=0.99, metadata_consistency=1.0))
@@ -132,6 +178,85 @@ def test_rank_puts_verified_first():
                                 image_similarity=0.2))
     strong = score_candidate(make(url="https://instagram.com/p/strong/"))
     assert rank([weak, strong])[0].url.endswith("strong/")
+
+
+# ---- face_similarity >= high_face_similarity_priority ranking rule --------
+#
+# A ranking rule only: it must never affect score_candidate()'s final_score,
+# face_match_threshold, or verified/stages — only the order rank() returns
+# verified candidates in.
+
+def _ranked(url: str, face_similarity: float, final_score: float,
+           platform_priority: int = 90) -> VerifiedCandidate:
+    return VerifiedCandidate(
+        engine="yandex", url=url, domain=url.split("/")[2],
+        platform_priority=platform_priority,
+        face_similarity=face_similarity, final_score=final_score,
+        verified=True, stages=[Stage.SEARCH_FOUND, Stage.FACE_MATCH, Stage.VERIFIED],
+    )
+
+
+def test_face_similarity_of_exactly_the_threshold_qualifies():
+    assert settings.high_face_similarity_priority == 0.75
+    at_threshold = _ranked("https://a.com/1", face_similarity=0.75, final_score=0.60)
+    # A much higher final_score must not be enough to outrank the priority group.
+    just_below = _ranked("https://b.com/1", face_similarity=0.749, final_score=0.99)
+    ranked = rank([just_below, at_threshold])
+    assert ranked[0].url == "https://a.com/1"
+
+
+def test_face_similarity_of_0_749_does_not_qualify():
+    just_below = _ranked("https://b.com/1", face_similarity=0.749, final_score=0.99)
+    much_lower = _ranked("https://c.com/1", face_similarity=0.30, final_score=0.10)
+    # Outside the priority group, existing signals (here: final_score) still
+    # decide — 0.749 does not get special treatment.
+    ranked = rank([much_lower, just_below])
+    assert ranked[0].url == "https://b.com/1"
+
+
+def test_priority_group_members_rank_by_face_similarity_not_final_score():
+    """A strong-face/weak-image hit must not be outranked by a weak-face/
+    strong-image hit purely because the latter scores better overall."""
+    strong_face_weak_image = _ranked("https://a.com/1", face_similarity=0.91, final_score=0.60)
+    weak_face_strong_image = _ranked("https://b.com/1", face_similarity=0.76, final_score=0.95)
+    ranked = rank([weak_face_strong_image, strong_face_weak_image])
+    assert ranked[0].url == "https://a.com/1"
+
+
+def test_the_documented_worked_example_ranks_exactly_as_specified():
+    """LinkedIn 0.91, Instagram 0.78, X 0.72, YouTube 0.61 — the two
+    qualifying (>=0.75) candidates lead regardless of image similarity."""
+    linkedin = _ranked("https://linkedin.com/in/x", face_similarity=0.91, final_score=0.853)
+    instagram = _ranked("https://instagram.com/p/x", face_similarity=0.78, final_score=0.84)
+    x_com = _ranked("https://x.com/x", face_similarity=0.72, final_score=0.826)
+    youtube = _ranked("https://youtube.com/x", face_similarity=0.61, final_score=0.767)
+
+    ranked = rank([youtube, x_com, instagram, linkedin])
+    assert [c.url for c in ranked] == [
+        "https://linkedin.com/in/x", "https://instagram.com/p/x",
+        "https://x.com/x", "https://youtube.com/x",
+    ]
+
+
+def test_priority_ranking_never_promotes_an_unverified_candidate():
+    """Verification status still dominates everything — a high face
+    similarity on a candidate that never verified must not outrank a
+    verified one, priority group or not."""
+    unverified_high_face = VerifiedCandidate(
+        engine="yandex", url="https://a.com/1", domain="a.com",
+        face_similarity=0.95, final_score=0.50, verified=False,
+        stages=[Stage.SEARCH_FOUND],
+    )
+    verified_lower_face = _ranked("https://b.com/1", face_similarity=0.40, final_score=0.71)
+    ranked = rank([unverified_high_face, verified_lower_face])
+    assert ranked[0].url == "https://b.com/1"
+
+
+def test_priority_ranking_does_not_alter_the_final_score_formula():
+    """The new ranking rule must be additive — score_candidate()'s output is
+    unaffected by high_face_similarity_priority."""
+    vc = score_candidate(make(face_similarity=0.91, image_similarity=0.50, metadata_consistency=0.5))
+    assert vc.final_score == pytest.approx(0.5 * 0.91 + 0.4 * 0.50 + 0.1 * 0.5)
 
 
 def test_highest_stage_reached_is_union_in_ladder_order():

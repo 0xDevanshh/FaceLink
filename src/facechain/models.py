@@ -418,6 +418,15 @@ class ThresholdSnapshot(BaseModel):
     weight_meta: float
     insightface_model: str
     face_backend: str
+    # Ranking-only cutoff (see `verification/scorer.py::rank`) — never
+    # confuse with `face_match_threshold`, which decides verification.
+    high_face_similarity_priority: float = 0.75
+    # When true, a candidate can also verify on face similarity alone (see
+    # `verification/scorer.py::score_candidate`'s `face_only_ok` path) —
+    # a real, deliberate accuracy tradeoff, recorded here so it is visible
+    # in the evidence rather than an invisible config flag.
+    face_only_verify_enabled: bool = False
+    face_only_verify_threshold: float = 0.50
     calibration_status: str = "DEFAULT"  # DEFAULT | CALIBRATED | CALIBRATION_INSUFFICIENT
     calibration_note: str = "thresholds are hand-set defaults, not calibrated on authorised pairs"
 

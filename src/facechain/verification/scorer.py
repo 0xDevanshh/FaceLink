@@ -69,7 +69,18 @@ def score_candidate(vc: VerifiedCandidate) -> VerifiedCandidate:
     vc.confidence_band = confidence_band(vc.face_similarity)
 
     required = {Stage.SEARCH_FOUND, Stage.FACE_MATCH}
-    if required.issubset(set(stages)) and vc.final_score >= settings.verify_min_score:
+    combined_score_ok = required.issubset(set(stages)) and vc.final_score >= settings.verify_min_score
+    # Opt-in, disabled by default (see config.py) — a second, independent path
+    # to VERIFIED based on face similarity alone, for a deployment that has
+    # explicitly decided the combined score is too strict. Still requires
+    # FACE_MATCH itself (face_ok), so this can never verify a candidate whose
+    # face didn't match at all.
+    face_only_ok = (
+        settings.face_only_verify_enabled
+        and face_ok
+        and vc.face_similarity >= settings.face_only_verify_threshold
+    )
+    if combined_score_ok or face_only_ok:
         stages.append(Stage.VERIFIED)
         vc.verified = True
 
@@ -115,11 +126,17 @@ def _rejection_reason(vc: VerifiedCandidate, stages: list[Stage]) -> str:
             f"face similarity {vc.face_similarity:.3f} below threshold "
             f"{settings.face_match_threshold}"
         )
-    return (
+    reason = (
         f"composite score {vc.final_score:.3f} below minimum "
         f"{settings.verify_min_score} (face {vc.face_similarity:.3f}, "
         f"image {vc.image_similarity:.3f})"
     )
+    if settings.face_only_verify_enabled:
+        reason += (
+            f"; face-only path also did not qualify (face {vc.face_similarity:.3f} "
+            f"< {settings.face_only_verify_threshold})"
+        )
+    return reason
 
 
 # Rungs that are claims about the *evidence* rather than about provenance.
@@ -145,14 +162,26 @@ def rank(candidates: list[VerifiedCandidate]) -> list[VerifiedCandidate]:
     also carried SOCIAL_MATCH and so appeared to have climbed one rung further.
     That is a platform name outranking a measurement, which is precisely what
     this ordering exists to prevent.
+
+    A candidate at or above `high_face_similarity_priority` is additionally
+    promoted ahead of every candidate below it, ranked among themselves by
+    face similarity first — a strong-face, weak-image-similarity hit (a
+    different photo of the same person) must not be outranked by a
+    weak-face, strong-image-similarity one (a near-identical copy of a
+    different person's picture) purely because the latter scores better on
+    `final_score`. This is a ranking rule only: it does not touch
+    `final_score`, `face_match_threshold`, or whether a candidate verifies at
+    all — `verified` still dominates every candidate that never qualified.
     """
+    threshold = settings.high_face_similarity_priority
     return sorted(
         candidates,
         key=lambda c: (
             c.verified,
+            c.face_similarity >= threshold,
+            c.face_similarity,
             evidential_strength(c),
             c.final_score,
-            c.face_similarity,
             # Negated so that a *lower* priority number sorts earlier under the
             # surrounding reverse=True.
             -c.platform_priority,
