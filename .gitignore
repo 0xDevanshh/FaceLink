@@ -21,16 +21,29 @@ __pycache__/
 .pytest_cache/
 *.egg-info/
 
+# partial/interrupted model downloads (see face/detector.py::_download)
+*.part
+
 # frontend
 frontend/node_modules/
 frontend/dist/
 frontend/.vite/
 frontend/coverage/
+# a stray `npm install` run from the repo root instead of frontend/ — the
+# real lockfile lives at frontend/package-lock.json
+/package-lock.json
 
-# uploads (server temp dir)
-/tmp/facechain_uploads/
+# uploads (server temp dir — defaults to /tmp/facechain_uploads outside the
+# repo, but FACECHAIN_UPLOAD_DIR can point it here; ignore either way)
+_uploads/
 
 # os / editor
 .DS_Store
 .idea/
 .vscode/
+
+# hand-run debug scripts — never commit one left at the repo root
+/check_*.py
+/inspect_*.py
+/final_validation.py
+/FIX_SUMMARY.md
