@@ -4,11 +4,29 @@ For each candidate URL we fetch the page ourselves, pull out the image the post
 actually displays, download it, and re-run both similarity tests locally. A
 search engine saying "this page matches" is a lead, not evidence.
 
-Reality check that shaped this module: social platforms often refuse anonymous
-page fetches (login walls, 403s). When that happens we fall back to the
-thumbnail the engine itself stored for that result — still a real image tied to
-that result, never a fabricated one — and we record which source was used in
-`candidate_image_source` so the evidence stays honest about its provenance.
+Image-source acquisition priority (highest trust first):
+  1. Direct image URL  — candidate URL itself is an image (GitHub avatar, CDN asset)
+  2. github:avatar     — real avatar from avatars.githubusercontent.com markup
+  3. og:image          — Open Graph meta tag  (most social platforms set this)
+  4. twitter:image     — Twitter card meta tag
+  5. link:image_src    — <link rel="image_src">
+  6. json-ld           — JSON-LD image / thumbnailUrl
+  7. img               — largest <img> tag by declared dimensions
+  8. engine-thumbnail  — LAST RESORT only; a compressed, typically ~50 px
+                         Google/Yandex cache copy.  Never used when a better
+                         source was already found.
+
+Why thumbnails are last: every engine-thumbnail is a re-encoded, heavily
+down-sampled version of the original image.  ArcFace cosine similarity between
+a 512-D embedding from the original photo and one from a 50 px Google thumbnail
+reliably scores below the 0.38 verification threshold even for the identical
+person — which was the root cause of false-rejection for all LinkedIn candidates
+(HTTP 999 → page not fetched → thumbnail used → face_similarity ≈ 0.19).
+
+The thumbnail remains in the fallback chain so a discovered URL is never
+silently abandoned, but its retrieval is logged distinctly and the evidence
+record shows ``candidate_image_source == "engine-thumbnail"`` so a reader can
+see exactly which source was used.
 """
 
 from __future__ import annotations
@@ -43,6 +61,13 @@ SKIP_IMAGE_HINTS = ("sprite", "logo", "icon", "avatar_default", "favicon",
                     "placeholder", "blank", "1x1", "spacer")
 CONTENT_TYPE_ALLOWLIST = ("image/jpeg", "image/png", "image/webp", "image/avif",
                           "image/gif", "image/bmp")
+
+# Source labels that come from the page itself (not an engine cache).
+# Used to decide whether an engine thumbnail fallback is warranted.
+_TRUSTED_SOURCES = frozenset({
+    "direct-image", "github:avatar",
+    "og:image", "twitter:image", "link:image_src", "json-ld", "img",
+})
 
 
 def _client() -> httpx.Client:
@@ -265,7 +290,18 @@ def verify_candidate(
     input_embedding: np.ndarray,
     cache: MediaCache | None = None,
 ) -> VerifiedCandidate:
-    """Fetch, download, and locally re-measure one candidate."""
+    """Fetch, download, and locally re-measure one candidate.
+
+    Acquisition priority (see module docstring):
+      direct-image > github:avatar > og:image > twitter:image >
+      link:image_src > json-ld > img > engine-thumbnail (last resort)
+
+    The engine thumbnail is only used when no trusted source succeeded — i.e.
+    the page was unreachable (login wall, bot block, network error) *and* no
+    page-extracted image could be downloaded.  When a trusted source is found
+    the thumbnail is skipped entirely so a low-quality cache copy never
+    displaces a genuine full-resolution image.
+    """
     vc = VerifiedCandidate(
         engine=candidate.engine,
         url=candidate.url,
@@ -284,26 +320,29 @@ def verify_candidate(
         vc.rejection_reason = "URL failed SSRF safety check"
         return vc
 
-    image_targets: list[tuple[str, str]] = []
+    # trusted_targets: sources from the page itself (priority 1-7)
+    # thumbnail_target: engine cache (priority 8, last resort only)
+    trusted_targets: list[tuple[str, str]] = []
+    thumbnail_target: tuple[str, str] | None = (
+        (candidate.thumbnail, "engine-thumbnail") if candidate.thumbnail else None
+    )
+
     with _client() as client:
-        # 1. the page itself — SSRF-safe with per-hop re-validation
+        # ---- Step 1: fetch the candidate page --------------------------
         try:
             resp, final_url = _safe_get(client, candidate.url)
             if resp is not None and resp.status_code == 200:
                 ctype = resp.headers.get("content-type", "")
                 cache.record_page_bytes(len(resp.content))
                 if "html" in ctype:
-                    # Size cap on page HTML.
                     raw = resp.content[:MAX_PAGE_BYTES].decode("utf-8", "replace")
                     vc.fetched = True
-                    image_targets = extract_image_urls(raw, final_url or candidate.url)
-                    vc.fetch_note = f"HTTP 200, {len(image_targets)} image refs"
+                    trusted_targets = extract_image_urls(raw, final_url or candidate.url)
+                    vc.fetch_note = f"HTTP 200, {len(trusted_targets)} image refs"
                 elif ctype.split(";")[0].strip().lower() in CONTENT_TYPE_ALLOWLIST:
-                    # The candidate URL *is* the image — a GitHub avatar or a
-                    # CDN asset an engine surfaced directly. Compare it as-is
-                    # rather than discarding a perfectly good measurement.
+                    # The candidate URL *is* the image (GitHub avatar, CDN asset).
                     vc.fetched = True
-                    image_targets = [(final_url or candidate.url, "direct-image")]
+                    trusted_targets = [(final_url or candidate.url, "direct-image")]
                     vc.fetch_note = f"HTTP 200, direct image ({ctype})"
                 else:
                     vc.fetch_note = f"HTTP 200 but content-type={ctype!r}"
@@ -314,16 +353,20 @@ def verify_candidate(
         except Exception as exc:  # noqa: BLE001
             vc.fetch_note = f"fetch failed: {type(exc).__name__}"
 
-        # 2. engine thumbnail as a documented fallback
-        if candidate.thumbnail:
-            image_targets.append((candidate.thumbnail, "engine-thumbnail"))
+        # ---- Step 2: find the best downloadable image ------------------
+        # Try trusted sources first (page-extracted), then thumbnail as
+        # last resort only if nothing better was found.
+        #
+        # "best" means highest perceptual similarity to the input — we want
+        # to pick the image that is most likely to be the original, which is
+        # the one that looks most like what we searched for.  Within trusted
+        # sources, the first downloadable one often wins because extraction
+        # order is already trust-ranked; the similarity tiebreak handles
+        # cases where og:image returns a banner and a lower-ranked img tag
+        # is actually the face photo.
 
-        if not image_targets:
-            vc.fetch_note += " | no comparable image found"
-            return vc
-
-        best: tuple[float, bytes, str, str] | None = None
-        for url, label in image_targets[:8]:
+        best_trusted: tuple[float, bytes, str, str] | None = None
+        for url, label in trusted_targets[:8]:
             data = cache.get_or_fetch(client, url)
             if data is None:
                 continue
@@ -332,10 +375,28 @@ def verify_candidate(
             except Exception:  # noqa: BLE001
                 continue
             sim = compare(input_hashes, cand_hashes)
-            if best is None or sim > best[0]:
-                best = (sim, data, url, label)
-            if sim >= 0.95:  # near-identical; no need to keep looking
+            if best_trusted is None or sim > best_trusted[0]:
+                best_trusted = (sim, data, url, label)
+            if sim >= 0.95:  # near-identical — no need to keep looking
                 break
+
+        # Use thumbnail only when no trusted source yielded an image.
+        best = best_trusted
+        if best is None and thumbnail_target is not None:
+            t_url, t_label = thumbnail_target
+            data = cache.get_or_fetch(client, t_url)
+            if data is not None:
+                try:
+                    cand_hashes = perceptual_hashes(data)
+                    sim = compare(input_hashes, cand_hashes)
+                    best = (sim, data, t_url, t_label)
+                    log.debug(
+                        "candidate %s: using engine-thumbnail as last resort "
+                        "(page fetch: %s)",
+                        candidate.url, vc.fetch_note,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
 
     if best is None:
         vc.fetch_note += " | no downloadable image"
@@ -348,7 +409,7 @@ def verify_candidate(
     vc.candidate_image_sha256 = sha256_bytes(data)
     vc.candidate_image_phash = perceptual_hashes(data)["phash"]
 
-    # ---- face comparison on the retrieved image --------------------------
+    # ---- Step 3: face comparison on the retrieved image ----------------
     img = decode_image(data)
     if img is not None:
         try:

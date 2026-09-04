@@ -39,7 +39,7 @@ from .browser import BrowserSession
 from .google_lens import GoogleLensAdapter
 from .serpapi import SerpApiAdapter
 from .tineye import TinEyeAdapter
-from .uploader import UploadError, publish_temporarily
+from .uploader import UploadError, publish_image, publish_temporarily
 from .variants import SearchVariant
 from .yandex import YandexAdapter
 
@@ -153,10 +153,13 @@ def _requires_public_url(name: str) -> bool:
 
 
 def _has_reliable_upload_alternative(name: str) -> bool:
-    if name in BROWSER_ADAPTERS:
-        return bool(getattr(BROWSER_ADAPTERS[name], "has_reliable_upload_alternative", False))
-    if name in API_ADAPTERS:
-        return bool(getattr(API_ADAPTERS[name](), "has_reliable_upload_alternative", False))
+    try:
+        if name in BROWSER_ADAPTERS:
+            return bool(getattr(BROWSER_ADAPTERS[name], "has_reliable_upload_alternative", False))
+        if name in API_ADAPTERS:
+            return bool(getattr(API_ADAPTERS[name](), "has_reliable_upload_alternative", False))
+    except Exception:  # noqa: BLE001 — a broken adapter stub must not abort the check
+        pass
     return False
 
 
@@ -334,20 +337,22 @@ def run_reverse_search(
     # use their much more reliable by-URL endpoints.
     public_url = image_url
     upload_failure: str | None = None
-    if public_url is None and settings.allow_upload_host:
-        # Lazy publication: only spend a real upload attempt when at least one
-        # selected engine would actually benefit. An engine with its own
-        # equally reliable first-party upload path (e.g. SerpAPI's Google
-        # Lens image_id flow) gains nothing from central hosting; a browser
-        # adapter's in-page upload flow is measurably more fragile than
-        # by-URL, so it still counts as benefiting.
-        if any(not _has_reliable_upload_alternative(name) for name in engines):
+    if public_url is None:
+        needs_url = any(not _has_reliable_upload_alternative(name) for name in engines)
+        if needs_url:
             try:
-                public_url = publish_temporarily(image_path)
+                # Local server takes priority (no external upload, instant TTL).
+                # Falls back to publish_temporarily (third-party host) when
+                # LOCAL_IMAGE_BASE_URL is not set and allow_upload_host is true.
+                if (settings.local_image_base_url or "").strip():
+                    from .uploader import publish_local as _pub_local
+                    public_url = _pub_local(image_path)
+                else:
+                    public_url = publish_temporarily(image_path)
                 emit("host", "ok", public_url)
             except UploadError as exc:
                 upload_failure = str(exc)
-                log.warning("temp hosting failed, falling back to upload flows: %s", exc)
+                log.warning("image publication failed, falling back to direct upload flows: %s", exc)
                 emit("host", "fail", str(exc))
         else:
             emit("host", "skip",

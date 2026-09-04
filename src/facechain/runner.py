@@ -35,6 +35,7 @@ from .verification.candidate import MediaCache, verify_candidate
 from .verification.evidence_graph import build_evidence_graph
 from .verification.image_similarity import perceptual_hashes
 from .verification.scorer import explain_failure, highest_stage_reached, rank, score_candidate
+from .face.luxand import search_face as luxand_search_face
 
 log = logging.getLogger(__name__)
 
@@ -81,14 +82,43 @@ MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
 # quietly turns into search exclusivity.
 WIDER_WEB_BUDGET_SHARE = 0.25
 
-# At most this many candidates from any single domain. A real run spent four of
-# twelve slots on four near-identical pages from one site, which crowds out
-# genuinely different sources without adding any independent evidence.
+# At most this many candidates from any single *registrable* (eTLD+1) domain.
+# Previously this cap applied per subdomain, which meant ca.linkedin.com,
+# in.linkedin.com, nl.linkedin.com etc. each consumed separate slots — so 53
+# LinkedIn candidates spread across country subdomains could fill 26 slots
+# without ever reaching the target profile.  eTLD+1 normalisation ensures the
+# cap is per brand, not per regional subdomain.
 MAX_PER_DOMAIN = 2
 
 
+def _root_domain(domain: str) -> str:
+    """Best-effort registrable (eTLD+1) domain from a raw hostname.
+
+    Splits on '.' and returns the last two labels, which covers the vast
+    majority of cases (linkedin.com, github.com, x.com, …) without requiring
+    a full public-suffix list dependency.  Three-part ccTLDs
+    (e.g. co.uk, com.au) are handled by taking the last three labels when the
+    penultimate label is 2-3 chars — an approximation that is accurate enough
+    for the deduplication purpose here.
+    """
+    parts = domain.lower().split(".")
+    if len(parts) <= 2:
+        return domain
+    # Heuristic: if the second-to-last label is very short it is likely a
+    # second-level registry indicator (co, com, net, org, …) — take 3 parts.
+    if len(parts) >= 3 and len(parts[-2]) <= 3:
+        return ".".join(parts[-3:])
+    return ".".join(parts[-2:])
+
+
 def _spread_domains(candidates: list, cap: int = MAX_PER_DOMAIN) -> list:
-    """Order-preserving pass that limits how many hits one domain contributes.
+    """Order-preserving pass that limits how many hits one root domain contributes.
+
+    The cap applies to the registrable (eTLD+1) domain rather than the full
+    subdomain, so ca.linkedin.com and in.linkedin.com both count against the
+    same "linkedin.com" slot.  This prevents a single platform's 50+ country-
+    subdomain variants from filling the entire verification budget before the
+    target profile is reached.
 
     Overflow is not discarded but appended after everything else, so a domain
     with many hits still gets looked at if budget remains.
@@ -97,8 +127,9 @@ def _spread_domains(candidates: list, cap: int = MAX_PER_DOMAIN) -> list:
     overflow: list = []
     seen: dict[str, int] = {}
     for cand in candidates:
-        seen[cand.domain] = seen.get(cand.domain, 0) + 1
-        (kept if seen[cand.domain] <= cap else overflow).append(cand)
+        root = _root_domain(cand.domain)
+        seen[root] = seen.get(root, 0) + 1
+        (kept if seen[root] <= cap else overflow).append(cand)
     return kept + overflow
 
 
@@ -108,6 +139,9 @@ def _verification_queue(candidates: list, limit: int) -> list:
     Priority platforms are drained first, but a slice of the budget is held back
     for everything else, so a strong match on a personal site or a conference
     page is still reachable in a run dominated by social hits.
+
+    Skipped candidates (beyond the budget) are logged at DEBUG level so the
+    absence of a known target can be diagnosed without re-running the scan.
     """
     if limit <= 0:
         return []
@@ -125,6 +159,17 @@ def _verification_queue(candidates: list, limit: int) -> list:
     if len(queue) < limit:
         seen = {id(c) for c in queue}
         queue += [c for c in candidates if id(c) not in seen][: limit - len(queue)]
+
+    # Log skipped candidates so a missing ground-truth hit is diagnosable.
+    queued_ids = {id(c) for c in queue}
+    skipped = [c for c in candidates if id(c) not in queued_ids]
+    if skipped:
+        log.debug(
+            "verification_queue: %d/%d candidates selected (budget=%d); "
+            "skipped: %s",
+            len(queue), len(candidates), limit,
+            ", ".join(f"{c.domain}[{c.platform or 'web'}]" for c in skipped[:20]),
+        )
     return queue
 
 
@@ -399,6 +444,11 @@ def run(opts: RunOptions, report: Reporter | None = None) -> Case:
     if opts.scan_depth == "deep":
         emit("verify:depth", "info", f"deep scan mode — budget {limit} candidates")
     queue = _verification_queue(search_report.candidates, limit)
+    emit(
+        "verify:queue", "info",
+        f"{len(queue)}/{search_report.total_candidates} candidates selected for verification "
+        f"(budget={limit}, depth={opts.scan_depth})",
+    )
 
     verified: list[VerifiedCandidate] = []
     media_cache = MediaCache()
@@ -435,6 +485,22 @@ def run(opts: RunOptions, report: Reporter | None = None) -> Case:
     emit("verify:media", "info",
          f"{media_cache.downloads} image download(s), {media_cache.hits} reused from cache, "
          f"{media_cache.total_bytes / (1024*1024):.1f}MB total")
+
+    # ---- 4a. optional Luxand cross-check ---------------------------------
+    # Independent cloud face recognition on the input image.  Additive only —
+    # never changes scores or thresholds, just adds an SSE event to the
+    # evidence trail so operators can see the second-opinion result.
+    if settings.luxand_api_key:
+        try:
+            luxand = luxand_search_face(str(path))
+            emit(
+                "verify:luxand", "ok" if luxand.matched else "info",
+                f"matched={luxand.matched} confidence={luxand.confidence:.3f} "
+                f"faces={luxand.faces_found} note={luxand.note}",
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("luxand cross-check raised: %s", exc)
+            emit("verify:luxand", "info", f"skipped ({type(exc).__name__})")
 
     # ---- 4b. image deduplication + corroboration -------------------------
     clusters = cluster_candidates(verified)

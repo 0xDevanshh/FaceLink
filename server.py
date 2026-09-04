@@ -44,6 +44,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from facechain.config import PLATFORM_PRIORITY, settings
 from facechain.runner import PipelineError, RunOptions, run
+from facechain.search.uploader import local_image_for_token, unregister_local_image
 from facechain.security.paths import PathTraversalError, safe_case_id, safe_upload_id
 from facechain.security.scrubber import install as install_scrubber, scrub
 
@@ -279,14 +280,14 @@ async def health() -> dict:
         "version": PIPELINE_VERSION,
         "engines_configured": {
             "serpapi": bool(settings.serpapi_key),
+            "luxand": bool(settings.luxand_api_key),
             "facecheck": bool(settings.facecheck_api_key),
             "search4faces": bool(settings.search4faces_api_key),
             "upload_host": settings.allow_upload_host,
+            "local_image_base_url": bool(settings.local_image_base_url),
         },
         "face_backend": settings.face_backend,
         "chain_mode_default": "skip",
-        # Whether the attestation path is configured at all. Booleans only —
-        # never the key itself.
         "chain_configured": bool(settings.private_key),
         "network": settings.network,
         "chain_id": settings.chain_id,
@@ -294,6 +295,45 @@ async def health() -> dict:
         "engine_timeout_s": settings.engine_timeout_s,
         "search_total_timeout_s": settings.search_total_timeout_s,
     }
+
+
+@app.get("/api/v1/tmp-image/{token}")
+async def serve_tmp_image(token: str) -> Response:
+    """Serve a temporarily-registered image by token.
+
+    Used by the local-server publication path (``LOCAL_IMAGE_BASE_URL``):
+    the orchestrator registers the uploaded image here before handing its
+    public URL to reverse-image-search engines, then unregisters it when
+    the scan is done.  Tokens are random 32-hex strings, expire after
+    ``_LOCAL_TOKEN_TTL_S`` seconds, and can only address files that the
+    pipeline itself registered — never arbitrary filesystem paths.
+    """
+    # Validate token shape before touching the registry — reject anything
+    # that looks like a path traversal attempt immediately.
+    import re as _re
+    if not _re.fullmatch(r"[0-9a-f]{32}", token):
+        raise HTTPException(400, "invalid token")
+
+    path = local_image_for_token(token)
+    if path is None:
+        raise HTTPException(404, "token not found or expired")
+
+    suffix = path.suffix.lower()
+    _MIME = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+             ".webp": "image/webp", ".gif": "image/gif", ".bmp": "image/bmp",
+             ".avif": "image/avif"}
+    media_type = _MIME.get(suffix, "application/octet-stream")
+
+    try:
+        data = path.read_bytes()
+    except OSError:
+        raise HTTPException(404, "image file not found") from None
+
+    return Response(
+        content=data,
+        media_type=media_type,
+        headers={"Cache-Control": "no-store", "X-Token-Prefix": token[:8]},
+    )
 
 
 @app.get("/api/v1/chain/status")

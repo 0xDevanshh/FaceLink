@@ -25,6 +25,8 @@ def _pin_settings_to_shipped_defaults(monkeypatch):
     """
     from facechain.config import settings
     monkeypatch.setattr(settings, "allow_upload_host", False)
+    monkeypatch.setattr(settings, "local_image_base_url", "")
+    monkeypatch.setattr(settings, "luxand_api_key", "")
     monkeypatch.setattr(settings, "high_face_similarity_priority", 0.75)
     monkeypatch.setattr(settings, "face_only_verify_enabled", False)
     monkeypatch.setattr(settings, "face_only_verify_threshold", 0.50)

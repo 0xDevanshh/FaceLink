@@ -242,7 +242,17 @@ class Settings(BaseSettings):
     max_candidates_per_engine: int = 60
     # Optional: turn a local file into a public URL so engines' by-URL search
     # endpoints can be used (far more reliable than their upload flows).
-    # OFF by default: it uploads your photo to a third-party host.
+    # Two publication paths (tried in order):
+    #
+    # 1. Local server — set LOCAL_IMAGE_BASE_URL to the server's own public
+    #    base URL (e.g. https://myhost:8000).  The FastAPI server exposes a
+    #    ``/api/v1/tmp-image/{token}`` route that serves the file for the
+    #    duration of the scan.  Nothing is uploaded to a third party.
+    #    This is the recommended path when the server is internet-reachable.
+    #
+    # 2. Third-party host — set ALLOW_UPLOAD_HOST=true to upload to Litterbox
+    #    (1h TTL) or UPLOAD_HOST.  Only used when LOCAL_IMAGE_BASE_URL is not set.
+    local_image_base_url: str = ""
     allow_upload_host: bool = False
     upload_host: str = "https://litterbox.catbox.moe/resources/internals/api.php"
     # Optional genuine reverse-image-search APIs (used only if key present).
@@ -314,6 +324,10 @@ class Settings(BaseSettings):
     # ---- API keys for Tier-1 / Tier-2 search ----------------------------
     facecheck_api_key: str = ""
     search4faces_api_key: str = ""
+    # Luxand.cloud face recognition API (https://luxand.cloud).
+    # When set, every verified candidate is also cross-checked against the
+    # Luxand recognition engine as an independent second opinion.
+    luxand_api_key: str = ""
 
     # ---- web server (FastAPI) -------------------------------------------
     api_host: str = "0.0.0.0"

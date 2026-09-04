@@ -1,26 +1,93 @@
-"""Optional: expose the input image at a temporary public URL.
+"""Expose the input image at a temporary public URL.
 
 Why this exists: every engine's *by-URL* reverse-search endpoint is far more
 reliable than its drag-and-drop upload flow, and SerpAPI requires a URL. To use
 those paths with a local file, the file must be reachable from the internet.
 
-This is OFF by default and must be enabled explicitly (`--allow-upload-host`),
-because it uploads the photo to a third-party host. Default host is Litterbox,
-which auto-deletes after 1 hour. If you already host the image somewhere, pass
-`--image-url` instead and nothing is uploaded anywhere.
+Two publication paths:
+
+1. **Local server** (``LOCAL_IMAGE_BASE_URL`` is set): the FastAPI server
+   already has a ``/api/v1/tmp-image/{token}`` route that serves any file
+   registered via ``register_local_image`` / ``unregister_local_image``.
+   When the caller knows the server's public base URL it can set
+   ``LOCAL_IMAGE_BASE_URL`` and images are served directly — no third-party
+   upload, no privacy concern, instant TTL on scan completion.
+
+2. **Third-party host** (``allow_upload_host=True``): uploads to Litterbox
+   (1h TTL) or any other host configured via ``UPLOAD_HOST``. Off by default
+   because it sends the photo to an external service.
+
+If you already host the image somewhere, pass ``--image-url`` instead and
+nothing is uploaded or registered anywhere.
 """
 
 from __future__ import annotations
 
 import logging
+import secrets
+import threading
 import time
 from pathlib import Path
+from typing import Optional
 
 import httpx
 
 from ..config import settings
 
 log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Local image registry — thread-safe token → (path, expiry_monotonic)
+# ---------------------------------------------------------------------------
+_local_registry: dict[str, tuple[Path, float]] = {}
+_local_registry_lock = threading.Lock()
+
+# How long a locally-registered image stays available after registration.
+# Sized well above the search stage's total budget so it is never evicted mid-scan.
+_LOCAL_TOKEN_TTL_S: float = 7200.0  # 2 hours
+
+
+def register_local_image(path: Path, ttl_s: float = _LOCAL_TOKEN_TTL_S) -> str:
+    """Register *path* for local serving and return the URL token.
+
+    The token is a 32-hex-character random string.  Call
+    ``unregister_local_image(token)`` when the scan is done; stale entries
+    are also pruned automatically by ``local_image_for_token``.
+    """
+    token = secrets.token_hex(16)
+    expiry = time.monotonic() + ttl_s
+    with _local_registry_lock:
+        _local_registry[token] = (path, expiry)
+    log.debug("local_image.registered token=%s path=%s ttl_s=%.0f", token, path, ttl_s)
+    return token
+
+
+def unregister_local_image(token: str) -> None:
+    """Remove *token* from the registry (best-effort, never raises)."""
+    with _local_registry_lock:
+        _local_registry.pop(token, None)
+    log.debug("local_image.unregistered token=%s", token)
+
+
+def local_image_for_token(token: str) -> Optional[Path]:
+    """Return the path for *token* if it exists and has not expired."""
+    now = time.monotonic()
+    with _local_registry_lock:
+        entry = _local_registry.get(token)
+        if entry is None:
+            return None
+        path, expiry = entry
+        if now > expiry:
+            del _local_registry[token]
+            log.debug("local_image.expired token=%s", token)
+            return None
+        return path
+
+
+def build_local_url(token: str) -> str:
+    """Construct the public URL for a locally-registered image token."""
+    base = (settings.local_image_base_url or "").rstrip("/")
+    return f"{base}/api/v1/tmp-image/{token}"
 
 
 class UploadError(RuntimeError):
@@ -70,10 +137,32 @@ def _validate_remote(url: str) -> None:
         )
 
 
-def publish_temporarily(image_path: str | Path, expiry: str = "1h") -> str:
-    """Upload, verify the result is actually fetchable, and return the URL.
+def publish_local(image_path: str | Path, ttl_s: float = _LOCAL_TOKEN_TTL_S) -> str:
+    """Register *image_path* with the local token registry and return its URL.
 
-    Raises `UploadError` on any failure — including a host that "succeeds"
+    Requires ``settings.local_image_base_url`` to be set to the server's own
+    public base URL (e.g. ``https://myserver.example.com:8000``).  When set,
+    this is the preferred path: it never contacts a third-party service, the
+    image stays on the host machine, and the token expires automatically.
+
+    Raises ``UploadError`` if ``local_image_base_url`` is not configured.
+    """
+    base = (settings.local_image_base_url or "").strip()
+    if not base:
+        raise UploadError(
+            "LOCAL_IMAGE_BASE_URL is not set — cannot publish via local server"
+        )
+    path = Path(image_path)
+    token = register_local_image(path, ttl_s=ttl_s)
+    url = build_local_url(token)
+    log.info("local_image.published token=%s url=%s", token, _redact(url))
+    return url
+
+
+def publish_temporarily(image_path: str | Path, expiry: str = "1h") -> str:
+    """Upload to the configured third-party host, validate, and return the URL.
+
+    Raises ``UploadError`` on any failure — including a host that "succeeds"
     with a 200 but returns something that isn't a working image URL.
     """
     if not settings.allow_upload_host:
@@ -117,6 +206,28 @@ def publish_temporarily(image_path: str | Path, expiry: str = "1h") -> str:
     return body
 
 
+def publish_image(image_path: str | Path) -> str:
+    """Publish *image_path* using the best available method and return a URL.
+
+    Priority:
+      1. Local server (``LOCAL_IMAGE_BASE_URL`` set) — no external service,
+         no privacy concern, instant availability.
+      2. Third-party host (``allow_upload_host=True``) — Litterbox or
+         whatever ``UPLOAD_HOST`` is configured to.
+
+    Raises ``UploadError`` if neither path is available.
+    """
+    # Try local server first — preferred when available.
+    if (settings.local_image_base_url or "").strip():
+        return publish_local(image_path)
+    if settings.allow_upload_host:
+        return publish_temporarily(image_path)
+    raise UploadError(
+        "no image publication method available — set LOCAL_IMAGE_BASE_URL "
+        "(recommended) or ALLOW_UPLOAD_HOST=true"
+    )
+
+
 def _diagnose(image_path: str) -> int:
     """`python -m facechain.search.uploader <path>` — safe-only diagnostics.
 
@@ -124,8 +235,10 @@ def _diagnose(image_path: str) -> int:
     body verbatim (it could echo request details) and never any credential.
     """
     path = Path(image_path)
-    print(f"backend: {settings.upload_host.split('/')[2] if '/' in settings.upload_host else settings.upload_host}")
+    local_base = (settings.local_image_base_url or "").strip()
+    print(f"local_image_base_url: {local_base or '(not set)'}")
     print(f"allow_upload_host: {settings.allow_upload_host}")
+    print(f"third-party backend: {settings.upload_host.split('/')[2] if '/' in settings.upload_host else settings.upload_host}")
     if not path.exists():
         print("input readable: no (file not found)")
         return 1
@@ -140,8 +253,16 @@ def _diagnose(image_path: str) -> int:
         print(f"image type: could not decode ({type(exc).__name__})")
         return 1
 
+    if local_base:
+        print("publication: local server (no upload)")
+        token = register_local_image(path)
+        url = build_local_url(token)
+        print(f"local URL: {url}")
+        unregister_local_image(token)
+        return 0
+
     if not settings.allow_upload_host:
-        print("publication: skipped (ALLOW_UPLOAD_HOST is false)")
+        print("publication: skipped (LOCAL_IMAGE_BASE_URL not set and ALLOW_UPLOAD_HOST is false)")
         return 0
 
     try:
