@@ -87,6 +87,8 @@ class ProviderReport(BaseModel):
     duration_s: float = 0.0
     query_mode: str = ""  # upload | by-url | api
     error: str = ""
+    public_url_available: bool = False
+    fallback_used: str = ""
 
     def rounded(self) -> "ProviderReport":
         p = self.model_copy()

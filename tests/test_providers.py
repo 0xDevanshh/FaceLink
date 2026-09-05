@@ -250,6 +250,49 @@ def test_api_engine_result_is_reported_under_the_requested_registry_key(monkeypa
     assert [p.engine for p in report.providers] == ["serpapi_yandex"]
 
 
+@pytest.mark.parametrize("browser_name, fallback_name", [
+    ("google_lens", "serpapi_google_lens"),
+    ("bing", "serpapi_bing"),
+])
+def test_challenged_browser_uses_one_configured_api_fallback(
+    monkeypatch, browser_name, fallback_name,
+):
+    """A deterministic browser challenge must route to the supported API once."""
+    class FakeBrowserAdapter:
+        requires_public_url = False
+        has_reliable_upload_alternative = True
+
+    calls: list[str] = []
+
+    def challenged(name, image_path, public_url):
+        calls.append(name)
+        return EngineResult(
+            name, ok=False, error="bot challenge interstitial (/sorry/)",
+            status=ProviderStatus.CHALLENGED, query_mode="by-url",
+        )
+
+    def api(name, image_path, public_url, upload_failure=None):
+        calls.append(name)
+        return _result(name, ["https://linkedin.com/in/recovered"])
+
+    monkeypatch.setattr(orchestrator, "BROWSER_ADAPTERS", {browser_name: FakeBrowserAdapter})
+    monkeypatch.setattr(orchestrator, "API_ADAPTERS", {
+        fallback_name: lambda: object(),
+    })
+    monkeypatch.setattr(orchestrator, "_run_browser_engine", challenged)
+    monkeypatch.setattr(orchestrator, "_run_api_engine", api)
+    monkeypatch.setattr(settings, "serpapi_key", "configured")
+
+    report, _ = run_reverse_search(
+        "x.jpg", engines=[browser_name], image_url="https://public.example/x.jpg"
+    )
+
+    assert calls == [browser_name, fallback_name]
+    assert report.provider(browser_name).status == ProviderStatus.CHALLENGED
+    assert report.provider(fallback_name).status == ProviderStatus.COMPLETED
+    assert report.total_candidates == 1
+
+
 def test_serpapi_bing_is_registered_with_the_correct_serpapi_engine_id():
     """Regression: the correct SerpAPI engine id for Bing reverse-image
     search is "bing_reverse_image", not "bing" (which silently returns

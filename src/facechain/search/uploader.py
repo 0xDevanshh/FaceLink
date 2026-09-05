@@ -206,7 +206,7 @@ def publish_temporarily(image_path: str | Path, expiry: str = "1h") -> str:
     return body
 
 
-def publish_image(image_path: str | Path) -> str:
+def publish_image(image_path: str | Path, *, validate: bool = False) -> str:
     """Publish *image_path* using the best available method and return a URL.
 
     Priority:
@@ -219,7 +219,19 @@ def publish_image(image_path: str | Path) -> str:
     """
     # Try local server first — preferred when available.
     if (settings.local_image_base_url or "").strip():
-        return publish_local(image_path)
+        try:
+            url = publish_local(image_path)
+            if validate:
+                try:
+                    _validate_remote(url)
+                except UploadError:
+                    unregister_local_image(url.rsplit("/", 1)[-1])
+                    raise
+            return url
+        except UploadError as exc:
+            if not settings.allow_upload_host:
+                raise
+            log.warning("local image publication failed; using configured fallback: %s", exc)
     if settings.allow_upload_host:
         return publish_temporarily(image_path)
     raise UploadError(

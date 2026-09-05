@@ -59,6 +59,14 @@ API_ADAPTERS = {
     "serpapi_bing": lambda: SerpApiAdapter("bing_reverse_image"),
 }
 
+# Browser challenges are terminal for that browser session. When the same
+# provider has a configured first-party API, use it once as a legitimate
+# fallback instead of retrying the blocked UI.
+BROWSER_API_FALLBACKS = {
+    "google_lens": "serpapi_google_lens",
+    "bing": "serpapi_bing",
+}
+
 # Error-text fingerprints, checked in order. Only used when an adapter did not
 # already report a precise status of its own.
 _ERROR_STATUS_HINTS: tuple[tuple[tuple[str, ...], ProviderStatus], ...] = (
@@ -144,6 +152,24 @@ def _run_api_engine(
     return res
 
 
+def _run_challenge_fallback(
+    browser_name: str, image_path: str, public_url: str | None,
+) -> EngineResult | None:
+    fallback_name = BROWSER_API_FALLBACKS.get(browser_name)
+    if not fallback_name or fallback_name not in API_ADAPTERS:
+        return None
+    if not settings.serpapi_key:
+        return None
+    log.info("%s challenged; using configured %s fallback once", browser_name, fallback_name)
+    try:
+        return _run_api_engine(fallback_name, image_path, public_url)
+    except Exception as exc:  # noqa: BLE001 - fallback must remain isolated
+        return EngineResult(
+            fallback_name, ok=False, query_mode="api",
+            error=f"fallback error: {type(exc).__name__}: {str(exc)[:200]}",
+        )
+
+
 def _requires_public_url(name: str) -> bool:
     if name in BROWSER_ADAPTERS:
         return bool(getattr(BROWSER_ADAPTERS[name], "requires_public_url", False))
@@ -201,6 +227,7 @@ def _run_engine_pass(
             emit(tag(name), "fail", "FAILED: unknown engine")
 
     results: list[EngineResult] = []
+    completed_by_name: dict[str, EngineResult] = {}
     timed_out = False
     if not planned:
         return results, providers, timed_out
@@ -254,6 +281,7 @@ def _run_engine_pass(
                 if not res.ok and elapsed >= settings.engine_timeout_s:
                     status = ProviderStatus.TIMEOUT
                 results.append(res)
+                completed_by_name[name] = res
                 providers.append(ProviderReport(
                     engine=res.engine or name,
                     status=status,
@@ -261,6 +289,7 @@ def _run_engine_pass(
                     duration_s=elapsed,
                     query_mode=res.query_mode,
                     error="" if status.produced_results else res.error[:300],
+                    public_url_available=bool(public_url),
                 ))
                 detail = (f"{status.value}: {len(res.candidates)} candidates"
                           if status.produced_results
@@ -282,6 +311,40 @@ def _run_engine_pass(
                 error="exceeded the search budget",
             ))
             emit(tag(name), "fail", f"{ProviderStatus.TIMEOUT.value}: search budget exhausted")
+
+        # A challenge is a provider-specific terminal state, not a reason to
+        # spend another browser request. A configured API fallback gets one
+        # bounded attempt and is recorded under its own provider name.
+        for name, res in list(completed_by_name.items()):
+            if _status_for(res) != ProviderStatus.CHALLENGED:
+                continue
+            fallback_name = BROWSER_API_FALLBACKS.get(name)
+            if not fallback_name or fallback_name in completed_by_name:
+                continue
+            if time.monotonic() >= stage_deadline:
+                continue
+            fallback_started = time.monotonic()
+            fallback = _run_challenge_fallback(name, image_path, public_url)
+            if fallback is None:
+                continue
+            fallback_status = _status_for(fallback)
+            fallback_elapsed = time.monotonic() - fallback_started
+            results.append(fallback)
+            providers.append(ProviderReport(
+                engine=fallback_name,
+                status=fallback_status,
+                candidates=len(fallback.candidates),
+                duration_s=fallback_elapsed,
+                query_mode=fallback.query_mode,
+                error="" if fallback_status.produced_results else fallback.error[:300],
+                public_url_available=bool(public_url),
+                fallback_used=name,
+            ))
+            emit(tag(fallback_name),
+                 "ok" if fallback_status.produced_results else "fail",
+                 (f"{fallback_status.value}: {len(fallback.candidates)} candidates"
+                  if fallback_status.produced_results
+                  else f"{fallback_status.value}: {fallback.error[:160]}"))
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
 
@@ -341,12 +404,12 @@ def run_reverse_search(
         needs_url = any(not _has_reliable_upload_alternative(name) for name in engines)
         if needs_url:
             try:
-                # Local server takes priority (no external upload, instant TTL).
-                # Falls back to publish_temporarily (third-party host) when
-                # LOCAL_IMAGE_BASE_URL is not set and allow_upload_host is true.
+                # Local server takes priority and validates that the route is
+                # reachable. A third-party host is only used when explicitly
+                # enabled and local publication cannot serve the image.
                 if (settings.local_image_base_url or "").strip():
-                    from .uploader import publish_local as _pub_local
-                    public_url = _pub_local(image_path)
+                    from .uploader import publish_image as _publish_image
+                    public_url = _publish_image(image_path, validate=True)
                 else:
                     public_url = publish_temporarily(image_path)
                 emit("host", "ok", public_url)
