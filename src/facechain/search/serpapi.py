@@ -62,6 +62,27 @@ SECTIONS = (
 )
 
 
+def _image_url_from(value: object) -> str:
+    """Normalise one SerpAPI image-field value to a plain URL string.
+
+    SerpAPI does not represent an image URL the same way across engines:
+    Google Lens gives a plain string (``"original": "https://..."``); Yandex
+    Images gives ``{"link": "https://...", "width": .., "height": ..}``
+    instead. Treating the second shape as a string (e.g. slicing it) raises
+    ``KeyError: slice(...)`` — a dict does not support slice indexing — which
+    is exactly the bug this function exists to prevent. Anything else
+    (missing field, unexpected shape) returns "" so a caller's `or` chain
+    falls through to the next candidate field.
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        link = value.get("link")
+        if isinstance(link, str):
+            return link
+    return ""
+
+
 class SerpApiAdapter(SearchEngineAdapter):
     """`engine` is the SerpAPI engine id, e.g. google_lens / yandex_images."""
 
@@ -182,21 +203,37 @@ class SerpApiAdapter(SearchEngineAdapter):
             for item in payload.get(section) or []:
                 if not isinstance(item, dict):
                     continue
-                link = item.get("link") or item.get("source_url") or item.get("url")
+                link = (
+                    _image_url_from(item.get("link"))
+                    or _image_url_from(item.get("source_url"))
+                    or _image_url_from(item.get("url"))
+                )
                 if not link:
                     continue
                 rows.append({
                     "href": link,
                     "text": item.get("title") or item.get("source") or "",
-                    # Prefer `original` (full-resolution source image, e.g.
-                    # media.licdn.com/dms/image/...) over `thumbnail` (Google's
-                    # compressed ~50 px cache copy, encrypted-tbn*.gstatic.com).
-                    # The old order (thumbnail or original) silently discarded the
-                    # full-res URL whenever a thumbnail was present — which is
-                    # always — causing ArcFace to compare against a 50 px cache
-                    # copy instead of the actual profile photo, producing
-                    # face_similarity ≈ 0.15–0.19 even for the correct person.
-                    "thumb": item.get("original") or item.get("thumbnail") or "",
+                    # Prefer a full-resolution source image over a compressed
+                    # cache thumbnail (Google's ~50px encrypted-tbn*.gstatic.com,
+                    # Yandex's avatars.mds.yandex.net cache copy) — the old
+                    # order silently discarded the full-res URL whenever a
+                    # thumbnail was present, which is always, causing ArcFace
+                    # to compare against a 50px cache copy instead of the
+                    # actual profile photo (face_similarity ~0.15-0.19 even for
+                    # the correct person).
+                    #
+                    # Field NAME and SHAPE both differ by engine: Google Lens
+                    # gives a plain string in "original"/"thumbnail"; Yandex
+                    # Images gives {"link": ..., "width":.., "height":..} under
+                    # "original_image"/"thumbnail" instead — a real production
+                    # bug (`dict[:500]` raising `KeyError: slice(...)`) traced
+                    # to assuming every engine used Lens' flat-string shape.
+                    # `_image_url_from` normalises both shapes to a plain URL.
+                    "thumb": (
+                        _image_url_from(item.get("original_image"))
+                        or _image_url_from(item.get("original"))
+                        or _image_url_from(item.get("thumbnail"))
+                    ),
                 })
 
         cands = build_candidates(self.name, rows)

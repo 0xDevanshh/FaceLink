@@ -34,7 +34,13 @@ from .search.variants import generate_variants, cleanup_variants
 from .verification.candidate import MediaCache, verify_candidate
 from .verification.evidence_graph import build_evidence_graph
 from .verification.image_similarity import perceptual_hashes
-from .verification.scorer import explain_failure, highest_stage_reached, rank, score_candidate
+from .verification.scorer import (
+    explain_failure,
+    explain_verified,
+    highest_stage_reached,
+    rank,
+    score_candidate,
+)
 from .enrichment.graph import enrich_case
 from .face.luxand import search_face as luxand_search_face
 
@@ -553,6 +559,7 @@ def run(opts: RunOptions, report: Reporter | None = None) -> Case:
         return case
 
     case.best_match = confirmed
+    confirmed.rank_explanation = explain_verified(confirmed, corr, graph)
     emit(
         "verify",
         "ok",

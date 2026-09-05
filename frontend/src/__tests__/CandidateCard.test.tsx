@@ -34,6 +34,7 @@ function makeCandidate(overrides: Partial<VerifiedCandidate> = {}): VerifiedCand
     final_score: 0.88,
     verified: true,
     rejection_reason: '',
+    rank_explanation: '',
     ...overrides,
   }
 }
@@ -67,6 +68,19 @@ describe('CandidateCard', () => {
       rejection_reason: 'face similarity 0.10 below threshold 0.38',
     })} />)
     expect(screen.getByText(/face similarity.*below threshold/i)).toBeInTheDocument()
+  })
+
+  it('shows the rank explanation for a verified candidate', () => {
+    render(<CandidateCard candidate={makeCandidate({
+      rank_explanation: 'Strong face match (0.920); on the exact retrieved image; '
+        + 'found on Instagram (a priority platform).',
+    })} />)
+    expect(screen.getByText(/Strong face match \(0\.920\)/)).toBeInTheDocument()
+  })
+
+  it('renders nothing extra when rank_explanation is absent (older evidence bundles)', () => {
+    render(<CandidateCard candidate={makeCandidate({ rank_explanation: '' })} />)
+    expect(screen.queryByText(/Strong face match/)).not.toBeInTheDocument()
   })
 
   it('shows STRONG confidence band', () => {

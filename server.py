@@ -44,7 +44,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from facechain.config import PLATFORM_PRIORITY, settings
 from facechain.runner import PipelineError, RunOptions, run
-from facechain.search.uploader import local_image_for_token, unregister_local_image
+from facechain.search.uploader import hosting_health, local_image_for_token, unregister_local_image
 from facechain.security.paths import PathTraversalError, safe_case_id, safe_upload_id
 from facechain.security.scrubber import install as install_scrubber, scrub
 
@@ -286,6 +286,12 @@ async def health() -> dict:
             "upload_host": settings.allow_upload_host,
             "local_image_base_url": bool(settings.local_image_base_url),
         },
+        # Real readiness for the temporary-public-URL path, not just whether a
+        # setting is present: a LOCAL_IMAGE_BASE_URL pointed at localhost/a LAN
+        # address is "configured" but not externally reachable, and providers
+        # that need a public URL (serpapi_yandex, bing) will fail either way —
+        # this makes that distinction explicit instead of silent.
+        "hosting": hosting_health(),
         "face_backend": settings.face_backend,
         "chain_mode_default": "skip",
         "chain_configured": bool(settings.private_key),
@@ -297,8 +303,8 @@ async def health() -> dict:
     }
 
 
-@app.get("/api/v1/tmp-image/{token}")
-async def serve_tmp_image(token: str) -> Response:
+@app.api_route("/api/v1/tmp-image/{token}", methods=["GET", "HEAD"])
+async def serve_tmp_image(token: str, request: Request) -> Response:
     """Serve a temporarily-registered image by token.
 
     Used by the local-server publication path (``LOCAL_IMAGE_BASE_URL``):
@@ -307,6 +313,12 @@ async def serve_tmp_image(token: str) -> Response:
     the scan is done.  Tokens are random 32-hex strings, expire after
     ``_LOCAL_TOKEN_TTL_S`` seconds, and can only address files that the
     pipeline itself registered — never arbitrary filesystem paths.
+
+    Explicitly routed for both GET and HEAD: a plain ``@app.get`` route only
+    ever registers GET, and a HEAD request (which a validating client sends
+    before trusting a URL) got a 405 instead of the headers-only response it
+    needs. HEAD returns the same headers as GET — including the real
+    Content-Length — with an empty body, per HTTP semantics.
     """
     # Validate token shape before touching the registry — reject anything
     # that looks like a path traversal attempt immediately.
@@ -329,10 +341,21 @@ async def serve_tmp_image(token: str) -> Response:
     except OSError:
         raise HTTPException(404, "image file not found") from None
 
+    # `inline` (not `attachment`) — a reverse-image engine's by-URL fetch must
+    # render/decode the bytes as an image, not be offered a save-as download.
+    # Content-Length is set explicitly to the real resource size so it is
+    # identical on GET and HEAD; Starlette only auto-computes it from `content`
+    # when the header isn't already present, so this value is trusted as-is
+    # even though HEAD's `content` below is empty.
     return Response(
-        content=data,
+        content=b"" if request.method == "HEAD" else data,
         media_type=media_type,
-        headers={"Cache-Control": "no-store", "X-Token-Prefix": token[:8]},
+        headers={
+            "Cache-Control": "no-store",
+            "Content-Disposition": f'inline; filename="{token}{suffix or ""}"',
+            "Content-Length": str(len(data)),
+            "X-Token-Prefix": token[:8],
+        },
     )
 
 

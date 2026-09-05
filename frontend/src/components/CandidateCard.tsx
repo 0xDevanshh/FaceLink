@@ -206,6 +206,14 @@ export default function CandidateCard({ candidate: c, rank, thresholds }: Props)
         )}
       </div>
 
+      {/* Why this candidate verified — the positive counterpart to a
+          rejection reason, shown only on a candidate that actually verified */}
+      {isVerified && c.rank_explanation && (
+        <div className="mt-2 text-xs text-success/90 bg-green-900/10 border border-success/20 rounded px-2 py-1">
+          ✓ {c.rank_explanation}
+        </div>
+      )}
+
       {/* Rejection reason */}
       {!isVerified && c.rejection_reason && (
         <div className="mt-2 text-xs text-danger/80 bg-red-900/10 border border-danger/20 rounded px-2 py-1">

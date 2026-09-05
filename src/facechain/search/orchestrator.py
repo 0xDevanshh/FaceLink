@@ -67,6 +67,30 @@ BROWSER_API_FALLBACKS = {
     "bing": "serpapi_bing",
 }
 
+# Short, greppable prefixes for `UploadError.reason` — turns "temporary image
+# publication failed: <prose>" into a precisely classified fact instead of an
+# opaque string, so a zero-candidate serpapi_yandex/bing result is never
+# reported as an unexplained "0" (see zero-result accountability in the
+# search-stage design notes above).
+_UPLOAD_REASON_PREFIX: dict[str, str] = {
+    "not_configured": "CONFIG_ERROR",
+    "unreachable_host": "PUBLIC_URL_UNREACHABLE",
+    "host_disabled": "HOST_DISABLED",
+    "validation_failed": "PUBLIC_URL_ERROR",
+    "network_error": "NETWORK_ERROR",
+    # Every configured third-party host (Litterbox, then its fallback) was
+    # tried and failed — a distinct, more precise fact than "one host had a
+    # problem" (`validation_failed`/`network_error`), so a caller can tell
+    # "no working hosting path exists right now at all" from "this specific
+    # provider's request failed".
+    "all_hosts_exhausted": "PUBLIC_URL_UNAVAILABLE",
+}
+
+
+def _classify_upload_failure(exc: UploadError) -> str:
+    prefix = _UPLOAD_REASON_PREFIX.get(getattr(exc, "reason", ""), "")
+    return f"{prefix}: {exc}" if prefix else str(exc)
+
 # Error-text fingerprints, checked in order. Only used when an adapter did not
 # already report a precise status of its own.
 _ERROR_STATUS_HINTS: tuple[tuple[tuple[str, ...], ProviderStatus], ...] = (
@@ -414,9 +438,9 @@ def run_reverse_search(
                     public_url = publish_temporarily(image_path)
                 emit("host", "ok", public_url)
             except UploadError as exc:
-                upload_failure = str(exc)
+                upload_failure = _classify_upload_failure(exc)
                 log.warning("image publication failed, falling back to direct upload flows: %s", exc)
-                emit("host", "fail", str(exc))
+                emit("host", "fail", upload_failure)
         else:
             emit("host", "skip",
                  "no selected engine needs central hosting (each has its own reliable path)")

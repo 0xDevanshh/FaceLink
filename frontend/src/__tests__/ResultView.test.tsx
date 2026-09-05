@@ -41,6 +41,7 @@ function makeCandidate(verified: boolean, overrides: Partial<VerifiedCandidate> 
     final_score: verified ? 0.88 : 0.12,
     verified,
     rejection_reason: verified ? '' : 'face similarity 0.10 below threshold 0.38',
+    rank_explanation: '',
     ...overrides,
   }
 }

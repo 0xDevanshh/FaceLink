@@ -213,6 +213,50 @@ def test_original_image_url_takes_priority_over_thumbnail_in_result_rows(tmp_pat
     assert compressed_thumb not in cand.thumbnail
 
 
+def test_yandex_images_nested_link_object_does_not_crash(tmp_path, monkeypatch):
+    """Regression for a real production incident: SerpAPI's Yandex Images
+    engine (unlike Google Lens) represents `original_image`/`thumbnail` as
+    ``{"link": "...", "width":.., "height":..}`` objects, not plain strings.
+    The old code did `item.get("original") or item.get("thumbnail") or ""`
+    then sliced the result — `dict[:500]` raises `KeyError: slice(...)`,
+    which silently took down every Yandex candidate row. This is the actual
+    real response shape captured from SerpAPI, field names included.
+    """
+    monkeypatch.setattr(settings, "serpapi_key", "test-key")
+    img = tmp_path / "face.jpg"
+    img.write_bytes(b"x" * 1000)
+
+    def fake_urlopen(req, timeout=None):
+        assert "url=https" in req.full_url or "url=http" in req.full_url
+        return _FakeResponse({
+            "image_results": [{
+                "title": "Someone",
+                "link": "https://ur.m.wikipedia.org/wiki/Someone",
+                "source": "ur.m.wikipedia.org",
+                "thumbnail": {
+                    "link": "https://avatars.mds.yandex.net/i?id=abc",
+                    "height": 90, "width": 148,
+                },
+                "original_image": {
+                    "link": "https://upload.wikimedia.org/wikipedia/commons/photo.jpg",
+                    "height": 640, "width": 480,
+                },
+            }]
+        })
+
+    monkeypatch.setattr("facechain.search.serpapi.urllib.request.urlopen", fake_urlopen)
+
+    result = SerpApiAdapter("yandex_images").search(str(img), image_url="https://cdn.example/photo.jpg")
+
+    assert result.status == ProviderStatus.COMPLETED
+    assert result.candidates
+    cand = result.candidates[0]
+    assert cand.url == "https://ur.m.wikipedia.org/wiki/Someone"
+    # The genuine full-resolution original wins over the cache thumbnail,
+    # with both correctly unwrapped from their nested {"link": ...} shape.
+    assert cand.thumbnail == "https://upload.wikimedia.org/wikipedia/commons/photo.jpg"
+
+
 def test_thumbnail_used_when_original_is_absent(tmp_path, monkeypatch):
     """When `original` is absent the existing `thumbnail` must still be used."""
     monkeypatch.setattr(settings, "serpapi_key", "test-key")

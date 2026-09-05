@@ -153,6 +153,9 @@ export interface VerifiedCandidate {
   final_score: number
   verified: boolean
   rejection_reason: string
+  // Plain-language rationale for why this candidate verified and ranked #1.
+  // "" for a rejected candidate, or for evidence bundles predating this field.
+  rank_explanation: string
 }
 
 export interface SearchVariantReport {

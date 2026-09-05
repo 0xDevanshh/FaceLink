@@ -32,7 +32,10 @@ function buildStageMap(events: SSEEvent[]): Record<string, StageState> {
     else if (evt.status === 'ok') map[key].status = 'ok'
     else if (evt.status === 'fail') map[key].status = 'fail'
     else if (evt.status === 'info' || evt.status === 'skip') map[key].status = 'skip'
-    if (evt.detail) map[key].details.push(evt.detail)
+    // The image-hosting diagnostic gets its own dedicated, translated status
+    // line (see `hostStatus()`) — it must not also leak its raw detail into
+    // this stage's generic technical-detail feed.
+    if (evt.detail && evt.stage !== 'search:host') map[key].details.push(evt.detail)
   }
   return map
 }
@@ -42,22 +45,39 @@ function buildStageMap(events: SSEEvent[]): Record<string, StageState> {
 const SOFT_PROVIDER_STATES = ['CHALLENGED', 'RATE_LIMITED', 'TIMEOUT', 'NOT_CONFIGURED',
   'NO_RESULTS', 'CANCELLED']
 
+// Plain-language gloss for each terminal ProviderStatus, shown as the chip's
+// *visible* label. The exact backend word (CHALLENGED, TIMEOUT, ...) and full
+// diagnostic detail are never discarded — they stay in the chip's `title`
+// tooltip for anyone who wants the precise, auditable fact — but a live scan
+// should read as calm status, not as a stack trace or a config instruction.
+const PROVIDER_STATUS_COPY: Record<string, string> = {
+  COMPLETED: 'Found matches',
+  NO_RESULTS: 'No matches found',
+  NOT_CONFIGURED: 'Not available',
+  CHALLENGED: 'Temporarily unavailable',
+  RATE_LIMITED: 'Temporarily unavailable',
+  TIMEOUT: 'Temporarily unavailable',
+  CANCELLED: 'Skipped (time budget)',
+  FAILED: 'Temporarily unavailable',
+}
+
 /**
  * Provider chips.
  *
  * The backend prefixes every provider event with `search:<engine>` and puts the
- * terminal `ProviderStatus` at the head of the detail string, so the label a
- * user sees is the same word recorded in the evidence bundle — CHALLENGED and
- * TIMEOUT stay distinguishable instead of collapsing into "failed".
+ * terminal `ProviderStatus` at the head of the detail string. That exact word
+ * (and the full detail) is preserved in `providerStatus`/`detail` for the
+ * tooltip; `label` is the friendly text a user actually reads.
  */
 function engineChips(events: SSEEvent[]): {
-  name: string; status: StageStatus; detail: string; providerStatus: string
+  name: string; status: StageStatus; detail: string; providerStatus: string; label: string
 }[] {
   const engines: Record<string, { status: StageStatus; detail: string; providerStatus: string }> = {}
   for (const evt of events) {
     if (!evt.stage.startsWith('search:')) continue
     const name = evt.stage.slice(7)
     if (name === 'platform') continue // platform tallies are not providers
+    if (name === 'host') continue // image-hosting diagnostics — not a search provider, see hostStatus()
     if (name.startsWith('variant:')) continue // extra search-variant passes get their own section
     if (!engines[name]) engines[name] = { status: 'idle', detail: '', providerStatus: '' }
     const e = engines[name]
@@ -73,7 +93,47 @@ function engineChips(events: SSEEvent[]): {
       }
     }
   }
-  return Object.entries(engines).map(([name, v]) => ({ name, ...v }))
+  return Object.entries(engines).map(([name, v]) => ({
+    name,
+    ...v,
+    label: PROVIDER_STATUS_COPY[v.providerStatus] ?? (v.status === 'running' ? 'Searching…' : v.providerStatus || v.status),
+  }))
+}
+
+// Friendly copy for the central image-hosting step, keyed by the reason
+// prefix the backend attaches to a publish failure (see
+// `search/orchestrator.py::_UPLOAD_REASON_PREFIX`). This step is internal
+// plumbing, not a search provider — it never renders as an engine chip.
+const HOST_STATUS_COPY: Record<string, string> = {
+  CONFIG_ERROR: 'No public link configured — continuing with providers that don’t need one',
+  PUBLIC_URL_UNREACHABLE: 'The configured public link isn’t externally reachable — continuing with providers that don’t need one',
+  HOST_DISABLED: 'Temporary hosting is disabled — continuing with providers that don’t need one',
+  PUBLIC_URL_ERROR: 'Could not verify the temporary public link — continuing with providers that don’t need one',
+  NETWORK_ERROR: 'Could not reach the temporary hosting service — continuing with providers that don’t need one',
+}
+
+function hostStatus(events: SSEEvent[]): { status: StageStatus; label: string; detail: string } | null {
+  // Last event wins — the host step reports its outcome once per scan.
+  let found: SSEEvent | null = null
+  for (const evt of events) {
+    if (evt.stage === 'search:host') found = evt
+  }
+  if (!found) return null
+  if (found.status === 'start') {
+    return { status: 'running', label: 'Preparing a temporary secure link for reverse search…', detail: '' }
+  }
+  if (found.status === 'ok') {
+    return { status: 'ok', label: 'Temporary public link ready', detail: found.detail }
+  }
+  if (found.status === 'skip') {
+    return { status: 'skip', label: 'No public link needed for the selected providers', detail: found.detail }
+  }
+  const prefix = (found.detail || '').split(':')[0].trim()
+  return {
+    status: 'skip',
+    label: HOST_STATUS_COPY[prefix] ?? 'No public link available — continuing with providers that don’t need one',
+    detail: found.detail,
+  }
 }
 
 /**
@@ -200,6 +260,7 @@ export default function ProgressView({ caseId, events, onEvent, onDone, onFailed
 
   const stageMap = buildStageMap(events)
   const chips = engineChips(events)
+  const host = hostStatus(events)
   const variantChipList = variantChips(events)
   const platforms = platformTallies(events)
   const candidates = candidateLines(events)
@@ -270,6 +331,27 @@ export default function ProgressView({ caseId, events, onEvent, onDone, onFailed
         })}
       </ol>
 
+      {/* Image hosting — internal plumbing, deliberately not a provider chip.
+          See Change 2 in the mission plan: a hosting diagnostic must never
+          render as if it were a search engine. */}
+      {host && (
+        <section className="mb-4" aria-labelledby="hosting-heading">
+          <h2 id="hosting-heading" className="text-xs font-semibold text-muted uppercase tracking-wider mb-2">
+            Image Hosting
+          </h2>
+          <div
+            title={host.detail || undefined}
+            className={`inline-flex px-3 py-1 rounded-full text-xs border
+              ${host.status === 'ok' ? 'border-success/60 text-success bg-green-900/10' :
+                host.status === 'skip' ? 'border-warn/60 text-warn bg-yellow-900/10' :
+                host.status === 'running' ? 'border-accent/60 text-accent bg-blue-900/10 animate-pulse' :
+                'border-border text-muted'}`}
+          >
+            {host.label}
+          </div>
+        </section>
+      )}
+
       {/* Engine chips */}
       {chips.length > 0 && (
         <section className="mb-6" aria-labelledby="engine-status-heading">
@@ -288,9 +370,9 @@ export default function ProgressView({ caseId, events, onEvent, onDone, onFailed
                     chip.status === 'fail' ? 'border-danger/60 text-danger bg-red-900/10' :
                     chip.status === 'running' ? 'border-accent/60 text-accent bg-blue-900/10 animate-pulse' :
                     'border-border text-muted'}`}
-                aria-label={`${chip.name}: ${chip.providerStatus || chip.status}`}
+                aria-label={`${chip.name}: ${chip.label}`}
               >
-                {chip.name} · {chip.providerStatus || chip.status}
+                {chip.name} · {chip.label}
               </div>
             ))}
           </div>

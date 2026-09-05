@@ -293,6 +293,11 @@ class VerifiedCandidate(BaseModel):
     final_score: float = 0.0
     verified: bool = False
     rejection_reason: str = ""  # populated when not verified
+    # Plain-language rationale for a VERIFIED best match — the positive
+    # counterpart to `rejection_reason`. Populated only on the candidate that
+    # verified (see `verification/scorer.py::explain_verified`), never
+    # inferred for a rejected one.
+    rank_explanation: str = ""
 
     def rounded(self) -> "VerifiedCandidate":
         c = self.model_copy()

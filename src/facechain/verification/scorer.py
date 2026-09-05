@@ -12,8 +12,14 @@ retrieved public image under the thresholds recorded in the evidence bundle.
 
 from __future__ import annotations
 
-from ..config import confidence_band, settings
+from typing import TYPE_CHECKING, Optional
+
+from ..config import OTHER_WEB_PRIORITY, RECOGNISED_PLATFORM_PRIORITY, confidence_band, settings
 from ..models import LADDER, CandidateType, Stage, VerifiedCandidate
+
+if TYPE_CHECKING:
+    from .clustering import CorroborationSummary
+    from .evidence_graph import EvidenceGraph
 
 
 def score_candidate(vc: VerifiedCandidate) -> VerifiedCandidate:
@@ -238,3 +244,47 @@ def explain_failure(candidates: list[VerifiedCandidate]) -> str:
         f"{settings.verify_min_score} (face {best.face_similarity:.3f}, "
         f"image {best.image_similarity:.3f})"
     )
+
+
+def explain_verified(
+    vc: VerifiedCandidate,
+    corr: Optional["CorroborationSummary"] = None,
+    graph: Optional["EvidenceGraph"] = None,
+) -> str:
+    """Say precisely why *vc* — the top-ranked, verified candidate — ranked #1.
+
+    The positive counterpart to `explain_failure`: every claim here must be
+    true of `vc` itself (its own measured fields), plus, when supplied, the
+    independent-corroboration evidence already computed for this run. Returns
+    "" for an unverified candidate — this function only ever explains a real
+    VERIFIED verdict, never speculates about one that didn't happen.
+    """
+    if not vc.verified:
+        return ""
+
+    parts = [f"{vc.confidence_band.title()} face match ({vc.face_similarity:.3f})"]
+
+    if vc.match_type == "exact-image":
+        parts.append("on the exact retrieved image")
+    elif vc.match_type == "face-only":
+        parts.append("on a different picture of the same face")
+
+    if vc.platform:
+        if vc.platform_priority < RECOGNISED_PLATFORM_PRIORITY:
+            tier = "a priority platform"
+        elif vc.platform_priority < OTHER_WEB_PRIORITY:
+            tier = "a named platform"
+        else:
+            tier = "the wider web"
+        parts.append(f"found on {vc.platform} ({tier})")
+
+    if graph is not None and graph.independent_evidence_count > 0:
+        n = graph.independent_evidence_count
+        parts.append(
+            f"corroborated by {n} independent source{'s' if n != 1 else ''} "
+            "on separate domains"
+        )
+    elif corr is not None and corr.independent_domains > 1:
+        parts.append(f"seen across {corr.independent_domains} distinct domains")
+
+    return "; ".join(parts) + "."

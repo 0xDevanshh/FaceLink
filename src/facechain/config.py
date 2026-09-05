@@ -126,6 +126,17 @@ SOCIAL_DOMAINS: dict[str, str] = {
     "github.com": "GitHub",
     "githubusercontent.com": "GitHub",
     "github.io": "GitHub",
+    # Professional/developer platforms `enrichment/extractor.py` already
+    # recognises for profile enrichment. Listed here too so a reverse-image
+    # hit that lands directly on one of these domains is attributed to its
+    # platform at discovery time rather than filed as unrecognised "Other Web"
+    # — the two layers must agree on what these hosts are.
+    "medium.com": "Medium",
+    "devfolio.co": "Devfolio",
+    "leetcode.com": "LeetCode",
+    "hackerrank.com": "HackerRank",
+    "kaggle.com": "Kaggle",
+    "stackoverflow.com": "StackOverflow",
 }
 
 # ---------------------------------------------------------------------------
@@ -255,6 +266,14 @@ class Settings(BaseSettings):
     local_image_base_url: str = ""
     allow_upload_host: bool = False
     upload_host: str = "https://litterbox.catbox.moe/resources/internals/api.php"
+    # Tried automatically, in order, only if `upload_host` fails or a WAF
+    # blocks it (observed: Litterbox intermittently 403s automated requests
+    # from some networks — a bot-challenge page, not a real error). uguu.se
+    # is a second anonymous, no-signup temporary image host whose links serve
+    # raw image bytes directly (verified: no HTML wrapper, no cookies, no
+    # redirect — see `search/uploader.py::_upload_to_uguu`). Never the only
+    # option tried: `publish_temporarily` still prefers `upload_host` first.
+    upload_fallback_host: str = "https://uguu.se/upload"
     # Optional genuine reverse-image-search APIs (used only if key present).
     serpapi_key: str = ""
 

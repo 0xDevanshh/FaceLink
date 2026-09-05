@@ -196,6 +196,32 @@ def test_every_priority_platform_has_an_entry_in_the_table():
         assert platform_priority(name) == PLATFORM_PRIORITY[name]
 
 
+# ---- professional/developer platforms -------------------------------------
+#
+# `enrichment/extractor.py` already recognises these for profile enrichment;
+# the search layer must agree, or a reverse-image hit landing directly on one
+# of these domains gets filed as unrecognised "Other Web" at the lowest
+# priority instead of being attributed to its actual platform.
+
+@pytest.mark.parametrize(
+    "url,platform",
+    [
+        ("https://medium.com/@someone/a-post-1234", "Medium"),
+        ("https://devfolio.co/@someone", "Devfolio"),
+        ("https://leetcode.com/someone", "LeetCode"),
+        ("https://www.hackerrank.com/someone", "HackerRank"),
+        ("https://kaggle.com/someone", "Kaggle"),
+        ("https://stackoverflow.com/users/12345/someone", "StackOverflow"),
+    ],
+)
+def test_professional_platforms_are_recognised(url, platform):
+    recognised, found, priority = classify_platform(url)
+    assert recognised and found == platform
+    # Named-but-not-priority tier — same as Facebook/Reddit today, not a
+    # reordering of the LinkedIn/Instagram/X/GitHub/YouTube priority list.
+    assert priority == RECOGNISED_PLATFORM_PRIORITY
+
+
 # ---- platform media CDNs -------------------------------------------------
 #
 # These matter more than they look. A reverse-image engine that finds someone's

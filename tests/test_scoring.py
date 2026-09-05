@@ -4,8 +4,11 @@ import pytest
 
 from facechain.config import settings
 from facechain.models import Stage, VerifiedCandidate
+from facechain.verification.clustering import CorroborationSummary
+from facechain.verification.evidence_graph import EvidenceGraph
 from facechain.verification.scorer import (
     explain_failure,
+    explain_verified,
     highest_stage_reached,
     rank,
     score_candidate,
@@ -304,6 +307,68 @@ def test_explain_failure_when_images_unreachable():
     blocked = score_candidate(make(candidate_image_sha256=None, image_similarity=0.0,
                                    face_detected=False, face_similarity=0.0))
     assert "login wall" in explain_failure([blocked]) or "comparable image" in explain_failure([blocked])
+
+
+# ---- verified-rank explanation: the positive counterpart to explain_failure
+
+def test_explain_verified_is_empty_for_an_unverified_candidate():
+    rejected = score_candidate(make(face_similarity=0.05, image_similarity=0.1))
+    assert not rejected.verified
+    assert explain_verified(rejected) == ""
+
+
+def test_explain_verified_cites_the_candidates_own_measured_numbers():
+    vc = score_candidate(make(face_similarity=0.92, image_similarity=0.95))
+    assert vc.verified
+    explanation = explain_verified(vc)
+    assert f"{vc.face_similarity:.3f}" in explanation
+    assert vc.confidence_band.lower() in explanation.lower()
+
+
+def test_explain_verified_distinguishes_exact_image_from_face_only():
+    exact = score_candidate(make(face_similarity=0.92, image_similarity=0.95))
+    assert "exact retrieved image" in explain_verified(exact)
+
+    # Below the exact-image threshold but a high enough combined score to
+    # still verify — a real repost/edit scenario, not the exact same picture.
+    face_only = score_candidate(make(face_similarity=0.99, image_similarity=0.50,
+                                     metadata_consistency=1.0))
+    assert face_only.verified and face_only.match_type == "face-only"
+    assert "different picture of the same face" in explain_verified(face_only)
+
+
+def test_explain_verified_names_the_platform_and_its_tier():
+    priority = score_candidate(make(platform="Instagram", platform_priority=2,
+                                    face_similarity=0.92, image_similarity=0.95))
+    assert "Instagram" in explain_verified(priority)
+    assert "priority platform" in explain_verified(priority)
+
+    wider_web = score_candidate(make(is_social=False, platform=None, platform_priority=90,
+                                     domain="news.example.com",
+                                     face_similarity=0.92, image_similarity=0.95))
+    # No platform name at all — nothing false is claimed about provenance.
+    assert "found on" not in explain_verified(wider_web)
+
+
+def test_explain_verified_cites_independent_evidence_when_present():
+    vc = score_candidate(make(face_similarity=0.92, image_similarity=0.95))
+    graph = EvidenceGraph(independent_evidence_count=3)
+    explanation = explain_verified(vc, graph=graph)
+    assert "3 independent sources" in explanation
+
+
+def test_explain_verified_falls_back_to_corroboration_domains_without_a_graph():
+    vc = score_candidate(make(face_similarity=0.92, image_similarity=0.95))
+    corr = CorroborationSummary(independent_domains=2)
+    explanation = explain_verified(vc, corr=corr)
+    assert "2 distinct domains" in explanation
+
+
+def test_explain_verified_never_claims_corroboration_that_was_not_found():
+    vc = score_candidate(make(face_similarity=0.92, image_similarity=0.95))
+    assert explain_verified(vc) != ""
+    assert "independent source" not in explain_verified(vc)
+    assert "distinct domains" not in explain_verified(vc)
 
 
 # ---- metadata consistency -------------------------------------------------

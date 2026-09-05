@@ -151,6 +151,14 @@ def test_publish_local_requires_base_url(tmp_path, monkeypatch):
 
 def test_publish_local_returns_correct_url(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "local_image_base_url", "https://myhost:8000")
+    # This test is about URL construction, not reachability — "myhost" is a
+    # placeholder that genuinely doesn't resolve, which the new external-
+    # reachability check (correctly) rejects. See test_uploader.py for
+    # dedicated reachability tests.
+    monkeypatch.setattr(
+        "facechain.search.uploader._host_is_externally_routable",
+        lambda url: (True, ""),
+    )
     img = tmp_path / "photo.jpg"
     img.write_bytes(b"data")
     url = publish_local(img)
@@ -165,6 +173,12 @@ def test_publish_local_returns_correct_url(tmp_path, monkeypatch):
 def test_publish_image_prefers_local_over_third_party(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "local_image_base_url", "https://myhost:8000")
     monkeypatch.setattr(settings, "allow_upload_host", True)
+    # "myhost" is a placeholder that doesn't resolve; this test is about
+    # local-vs-third-party priority, not reachability itself.
+    monkeypatch.setattr(
+        "facechain.search.uploader._host_is_externally_routable",
+        lambda url: (True, ""),
+    )
     img = tmp_path / "photo.jpg"
     img.write_bytes(b"data")
     url = publish_image(img)
@@ -534,6 +548,55 @@ def test_tmp_image_serves_registered_file(tmp_path, monkeypatch):
         assert resp.status_code == 200
         assert resp.content == data
         assert resp.headers["content-type"].startswith("image/png")
+    finally:
+        unregister_local_image(token)
+
+
+def test_tmp_image_serves_head_identically_to_get_without_a_body(tmp_path):
+    # A reverse-image engine's URL-validation step often issues HEAD before
+    # GET — it must see the same Content-Type/Content-Length as the real GET,
+    # with no body, not a 404/405 or a different response shape.
+    import server as srv
+    from fastapi.testclient import TestClient
+
+    img = tmp_path / "face.png"
+    data = png_bytes()
+    img.write_bytes(data)
+    token = register_local_image(img)
+
+    try:
+        client = TestClient(srv.app)
+        head = client.head(f"/api/v1/tmp-image/{token}")
+        get = client.get(f"/api/v1/tmp-image/{token}")
+        assert head.status_code == get.status_code == 200
+        assert head.headers["content-type"] == get.headers["content-type"]
+        assert head.headers["content-length"] == get.headers["content-length"]
+        assert head.content == b""
+    finally:
+        unregister_local_image(token)
+
+
+def test_tmp_image_sets_inline_content_disposition_and_content_length(tmp_path):
+    # Required so a fetching engine renders the bytes as an image rather than
+    # being offered a save-as download, and so it can size the response
+    # up front without reading the whole body first.
+    import server as srv
+    from fastapi.testclient import TestClient
+
+    img = tmp_path / "face.png"
+    data = png_bytes()
+    img.write_bytes(data)
+    token = register_local_image(img)
+
+    try:
+        client = TestClient(srv.app)
+        resp = client.get(f"/api/v1/tmp-image/{token}")
+        assert resp.status_code == 200
+        assert resp.headers["content-length"] == str(len(data))
+        disposition = resp.headers["content-disposition"]
+        assert disposition.startswith("inline")
+        assert token in disposition
+        assert resp.headers["cache-control"] == "no-store"
     finally:
         unregister_local_image(token)
 

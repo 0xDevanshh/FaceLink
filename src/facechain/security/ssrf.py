@@ -60,6 +60,16 @@ def _is_blocked_ip(ip_str: str) -> bool:
     return any(addr in net for net in _BLOCKED_NETWORKS)
 
 
+def is_blocked_ip(ip_str: str) -> bool:
+    """Public wrapper: is *ip_str* a private/loopback/link-local address?
+
+    Lets other modules (e.g. the temp-image-hosting reachability check in
+    `search.uploader`) reuse this single blocked-network list instead of
+    keeping a second copy of it.
+    """
+    return _is_blocked_ip(ip_str)
+
+
 def resolve_and_check(host: str) -> str:
     """Resolve host → IP and assert it is a public routable address.
 

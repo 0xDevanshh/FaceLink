@@ -242,7 +242,12 @@ describe('ProgressView', () => {
     expect(screen.getByText(/● Stopped/)).toBeInTheDocument()
   })
 
-  it('shows a challenged provider as a warning, not a scan failure', () => {
+  it('shows a challenged provider as a friendly, calm status — not raw diagnostics', () => {
+    // The visible chip label is user-facing copy (Section 10: SEARCHING /
+    // FOUND / NO_MATCH / TEMPORARILY_UNAVAILABLE / COMPLETED), not the raw
+    // ProviderStatus word or prose error — those stay available in `title`
+    // for anyone who inspects the chip, but must not be the primary label a
+    // user reads during a live scan.
     render(
       <ProgressView
         caseId="case_chal"
@@ -253,10 +258,36 @@ describe('ProgressView', () => {
         onEvent={onEvent} onDone={onDone} onFailed={onFailed} />,
     )
     const chips = screen.getByLabelText('Engine status chips')
-    expect(chips.textContent).toMatch(/bing · CHALLENGED/)
-    expect(chips.textContent).toMatch(/yandex · COMPLETED/)
+    expect(chips.textContent).toMatch(/bing · Temporarily unavailable/)
+    expect(chips.textContent).toMatch(/yandex · Found matches/)
+    expect(chips.textContent).not.toMatch(/CHALLENGED/)
+    expect(chips.textContent).not.toMatch(/COMPLETED/)
+    // The raw diagnostic is still there for anyone who inspects the chip.
+    expect(document.querySelector('[title*="CHALLENGED"]')).toBeTruthy()
     // A challenged provider is not a terminal error for the scan.
     expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('never renders the internal "host" publish step as a search provider chip', () => {
+    // Regression: the central image-publish step used to be re-tagged
+    // `search:host` and picked up by the generic `search:*` chip parser,
+    // rendering a hosting failure as if it were a fake "host" search engine
+    // with the raw exception string as its label.
+    render(
+      <ProgressView
+        caseId="case_host"
+        events={[
+          makeEvt('search:host', 'fail',
+            'HOST_DISABLED: temporary hosting disabled (pass --allow-upload-host to enable)'),
+          makeEvt('search:yandex', 'ok', 'COMPLETED: 60 candidates'),
+        ]}
+        onEvent={onEvent} onDone={onDone} onFailed={onFailed} />,
+    )
+    expect(screen.queryByLabelText(/^host:/)).toBeNull()
+    expect(screen.queryByText(/HOST_DISABLED/)).toBeNull()
+    // It gets its own, clearly-labeled, non-provider status line instead.
+    expect(screen.getByText('Image Hosting')).toBeInTheDocument()
+    expect(screen.getByText(/temporary hosting is disabled/i)).toBeInTheDocument()
   })
 
   it('renders per-platform discovery tallies including zeros', () => {
