@@ -13,7 +13,9 @@ All offline — `urllib.request.urlopen` is monkeypatched.
 
 from __future__ import annotations
 
+import io
 import json
+import urllib.error
 
 import pytest
 
@@ -282,3 +284,133 @@ def test_thumbnail_used_when_original_is_absent(tmp_path, monkeypatch):
     result = SerpApiAdapter("google_lens").search(str(img))
     assert result.candidates
     assert result.candidates[0].thumbnail == compressed_thumb
+
+
+# ---- bing_reverse_image: real production incident regressions -------------
+
+def test_bing_reverse_image_uses_the_image_url_param_not_url(tmp_path, monkeypatch):
+    """Regression: SerpAPI's bing_reverse_image engine rejects the generic
+    `url` parameter every other engine accepts, with HTTP 400 "Missing query
+    `image_url` parameter." — it needs `image_url` instead."""
+    monkeypatch.setattr(settings, "serpapi_key", "test-key")
+    img = tmp_path / "face.jpg"
+    img.write_bytes(b"fake")
+
+    seen_urls = []
+
+    def fake_urlopen(req, timeout=None):
+        seen_urls.append(req.full_url)
+        return _FakeResponse({"pages_with_this_image": []})
+
+    monkeypatch.setattr("facechain.search.serpapi.urllib.request.urlopen", fake_urlopen)
+    SerpApiAdapter("bing_reverse_image").search(str(img), image_url="https://cdn.example/photo.jpg")
+
+    assert seen_urls
+    query = seen_urls[0].split("?", 1)[1]
+    assert "image_url=https" in query or "image_url=http" in query
+    assert "&url=" not in f"&{query}"
+
+
+def test_bings_own_link_is_a_viewer_permalink_source_field_is_the_real_page(tmp_path, monkeypatch):
+    """Regression: bing_reverse_image's "link" field is always a bing.com
+    image-viewer permalink (bing.com/images/search?view=detailv2&...), never
+    the actual page the image was found on — using it produced zero usable
+    candidates on every single search, even a fully successful API call,
+    because bing.com is filtered as junk-domain chrome downstream. "source"
+    is the genuine external page URL and must win for this engine only.
+    """
+    monkeypatch.setattr(settings, "serpapi_key", "test-key")
+    img = tmp_path / "face.jpg"
+    img.write_bytes(b"fake")
+
+    def fake_urlopen(req, timeout=None):
+        return _FakeResponse({
+            "pages_with_this_image": [{
+                "title": "A real article",
+                "link": "https://www.bing.com/images/search?view=detailv2&id=ABC123",
+                "source": "https://www.example-news.com/article-about-someone",
+                "original": "https://cdn.example-news.com/full-res.jpg",
+                "thumbnail": "https://tse1.mm.bing.net/th/id/tiny-cached-thumb",
+            }],
+        })
+
+    monkeypatch.setattr("facechain.search.serpapi.urllib.request.urlopen", fake_urlopen)
+    result = SerpApiAdapter("bing_reverse_image").search(str(img), image_url="https://cdn.example/photo.jpg")
+
+    assert result.status == ProviderStatus.COMPLETED
+    assert result.candidates
+    cand = result.candidates[0]
+    assert cand.url == "https://www.example-news.com/article-about-someone"
+    assert "bing.com" not in cand.url
+    # Original full-res image still wins over the compressed cache thumbnail.
+    assert cand.thumbnail == "https://cdn.example-news.com/full-res.jpg"
+
+
+def test_other_engines_still_prefer_link_over_source(tmp_path, monkeypatch):
+    """The source/link swap above must stay scoped to bing_reverse_image —
+    Google Lens's "source" is a plain site-name label, not a URL, and must
+    never be preferred over its real "link" field."""
+    monkeypatch.setattr(settings, "serpapi_key", "test-key")
+    img = tmp_path / "face.jpg"
+    img.write_bytes(b"fake")
+
+    def fake_urlopen(req, timeout=None):
+        if "serpapi.com/image" in req.full_url:
+            return _FakeResponse({"image_id": "id1"})
+        return _FakeResponse({
+            "visual_matches": [{
+                "link": "https://instagram.com/p/real-post/",
+                "source": "Instagram",  # a label, not a URL
+                "title": "A post",
+            }],
+        })
+
+    monkeypatch.setattr("facechain.search.serpapi.urllib.request.urlopen", fake_urlopen)
+    result = SerpApiAdapter("google_lens").search(str(img))
+    assert result.candidates
+    assert result.candidates[0].url == "https://instagram.com/p/real-post/"
+
+
+def test_pages_with_this_image_section_is_parsed(tmp_path, monkeypatch):
+    """Regression: `pages_with_this_image` — bing_reverse_image's actual
+    section key for this concept — was previously entirely absent from the
+    parsed SECTIONS list, silently discarding every Bing result even on a
+    successful, well-formed API response."""
+    monkeypatch.setattr(settings, "serpapi_key", "test-key")
+    img = tmp_path / "face.jpg"
+    img.write_bytes(b"fake")
+
+    def fake_urlopen(req, timeout=None):
+        return _FakeResponse({
+            "pages_with_this_image": [{
+                "title": "t",
+                "link": "https://www.bing.com/images/search?x=1",
+                "source": "https://example.com/found-here",
+            }],
+        })
+
+    monkeypatch.setattr("facechain.search.serpapi.urllib.request.urlopen", fake_urlopen)
+    result = SerpApiAdapter("bing_reverse_image").search(str(img), image_url="https://cdn.example/photo.jpg")
+    assert result.candidates and result.candidates[0].url == "https://example.com/found-here"
+
+
+def test_http_error_body_is_surfaced_instead_of_a_bare_status_message(tmp_path, monkeypatch):
+    """Regression: `urllib` discards the response body on a non-2xx status by
+    default, so a real, specific SerpAPI error ("Missing query `image_url`
+    parameter.") was reported as an opaque "HTTPError: HTTP Error 400: Bad
+    Request" — undiagnosable without a manual repro against the live API.
+    """
+    monkeypatch.setattr(settings, "serpapi_key", "test-key")
+    img = tmp_path / "face.jpg"
+    img.write_bytes(b"fake")
+
+    def fake_urlopen(req, timeout=None):
+        body = b'{"error": "Missing query `image_url` parameter."}'
+        raise urllib.error.HTTPError(req.full_url, 400, "Bad Request", None, io.BytesIO(body))
+
+    monkeypatch.setattr("facechain.search.serpapi.urllib.request.urlopen", fake_urlopen)
+    result = SerpApiAdapter("bing_reverse_image").search(str(img), image_url="https://cdn.example/photo.jpg")
+
+    assert not result.ok
+    assert "Missing query" in result.error
+    assert "image_url" in result.error

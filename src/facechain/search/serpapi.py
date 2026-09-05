@@ -28,6 +28,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -41,19 +42,29 @@ ENDPOINT = "https://serpapi.com/search.json"
 IMAGE_UPLOAD_ENDPOINT = "https://serpapi.com/image"
 # SerpAPI's own direct-upload limit for Google Lens.
 MAX_UPLOAD_BYTES = 500 * 1024
-# SerpAPI engine ids that have no upload alternative — `url` is mandatory.
+# SerpAPI engine ids that have no upload alternative — a public URL is mandatory.
 URL_ONLY_ENGINES = frozenset({"yandex_images", "bing_reverse_image"})
+
+# Which query-parameter name each engine expects for a public image URL.
+# Verified against SerpAPI's actual behavior, not assumed: Google Lens and
+# Yandex Images both accept `url`; `bing_reverse_image` is the one exception
+# and rejects `url` outright with HTTP 400 "Missing query `image_url`
+# parameter" — a real production incident this table exists to prevent.
+_URL_PARAM_NAME: dict[str, str] = {"bing_reverse_image": "image_url"}
 
 # SerpAPI result sections that contain page URLs, in order of usefulness.
 # Listed generously on purpose: SerpAPI renames and reshuffles these as the
 # upstream engines change, and a section we do not read is a real result
-# silently discarded.
+# silently discarded. `pages_with_this_image` is `bing_reverse_image`'s actual
+# key for this concept — distinct from (and previously missing alongside)
+# `pages_with_matching_images`, which some other engines use.
 SECTIONS = (
     "image_results",
     "images_results",
     "visual_matches",
     "exact_matches",
     "pages_with_matching_images",
+    "pages_with_this_image",
     "related_content",
     "knowledge_graph",
     "inline_images",
@@ -156,7 +167,7 @@ class SerpApiAdapter(SearchEngineAdapter):
 
         params = {"engine": self.serp_engine, "api_key": settings.serpapi_key}
         if image_url:
-            params["url"] = image_url
+            params[_URL_PARAM_NAME.get(self.serp_engine, "url")] = image_url
         elif self.supports_upload:
             try:
                 params["image_id"] = self._upload_for_image_id(image_path)
@@ -186,6 +197,19 @@ class SerpApiAdapter(SearchEngineAdapter):
             req = urllib.request.Request(query, headers={"User-Agent": settings.user_agent})
             with urllib.request.urlopen(req, timeout=settings.search_timeout_s) as resp:
                 payload = json.loads(resp.read().decode("utf-8", "replace"))
+        except urllib.error.HTTPError as exc:
+            # `urllib` raises on any non-2xx status and discards the response
+            # body by default — but SerpAPI puts the actual, specific reason
+            # there (e.g. "Missing query `image_url` parameter."), and a bare
+            # "HTTP Error 400: Bad Request" hides it. A production incident
+            # (wrong param name for bing_reverse_image) went undiagnosed for a
+            # while because of exactly this — read the body before reporting.
+            try:
+                body = exc.read().decode("utf-8", "replace")[:200]
+            except Exception:  # noqa: BLE001
+                body = ""
+            return EngineResult(self.name, ok=False, query_mode="api",
+                                error=f"HTTP {exc.code}: {body or str(exc)}")
         except Exception as exc:  # noqa: BLE001
             return EngineResult(self.name, ok=False, query_mode="api",
                                 error=f"{type(exc).__name__}: {str(exc)[:200]}")
@@ -203,11 +227,26 @@ class SerpApiAdapter(SearchEngineAdapter):
             for item in payload.get(section) or []:
                 if not isinstance(item, dict):
                     continue
-                link = (
-                    _image_url_from(item.get("link"))
-                    or _image_url_from(item.get("source_url"))
-                    or _image_url_from(item.get("url"))
-                )
+                if self.serp_engine == "bing_reverse_image":
+                    # Bing's own "link" is always a bing.com image-viewer
+                    # permalink (bing.com/images/search?view=detailv2&...),
+                    # never the page the image was actually found on — every
+                    # row was silently discarded downstream as junk-domain
+                    # chrome (bing.com is in `JUNK_DOMAINS`), producing zero
+                    # usable candidates even on a fully successful API call.
+                    # "source" is the genuine external source-page URL.
+                    link = (
+                        _image_url_from(item.get("source"))
+                        or _image_url_from(item.get("link"))
+                        or _image_url_from(item.get("source_url"))
+                        or _image_url_from(item.get("url"))
+                    )
+                else:
+                    link = (
+                        _image_url_from(item.get("link"))
+                        or _image_url_from(item.get("source_url"))
+                        or _image_url_from(item.get("url"))
+                    )
                 if not link:
                     continue
                 rows.append({
