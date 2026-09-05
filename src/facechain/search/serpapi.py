@@ -50,6 +50,7 @@ URL_ONLY_ENGINES = frozenset({"yandex_images", "bing_reverse_image"})
 # silently discarded.
 SECTIONS = (
     "image_results",
+    "images_results",
     "visual_matches",
     "exact_matches",
     "pages_with_matching_images",
@@ -168,6 +169,11 @@ class SerpApiAdapter(SearchEngineAdapter):
             return EngineResult(self.name, ok=False, query_mode="api",
                                 error=f"{type(exc).__name__}: {str(exc)[:200]}")
 
+        if not isinstance(payload, dict):
+            return EngineResult(
+                self.name, ok=False, query_mode="api",
+                error=f"malformed API response: expected object, got {type(payload).__name__}",
+            )
         if payload.get("error"):
             return EngineResult(self.name, ok=False, query_mode="api", error=str(payload["error"])[:200])
 

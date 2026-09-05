@@ -198,6 +198,10 @@ class SearchCandidate(BaseModel):
     # Which search variant first surfaced this hit. "" for the historical
     # single-image search path, where the question does not arise.
     found_via_variant: str = ""
+    # Filled by the verification stage so a raw hit that was not measured is
+    # distinguishable from a candidate that was measured and rejected.
+    verification_queued: bool = False
+    verification_exclusion_reason: str = ""
 
 
 class SearchVariantReport(BaseModel):

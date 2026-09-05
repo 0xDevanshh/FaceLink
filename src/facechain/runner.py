@@ -150,6 +150,10 @@ def _verification_queue(candidates: list, limit: int) -> list:
         return []
     from .config import OTHER_WEB_PRIORITY
 
+    for candidate in candidates:
+        candidate.verification_queued = False
+        candidate.verification_exclusion_reason = ""
+
     candidates = _spread_domains(candidates)
     priority = [c for c in candidates if c.platform_priority < OTHER_WEB_PRIORITY]
     wider = [c for c in candidates if c.platform_priority >= OTHER_WEB_PRIORITY]
@@ -166,6 +170,12 @@ def _verification_queue(candidates: list, limit: int) -> list:
     # Log skipped candidates so a missing ground-truth hit is diagnosable.
     queued_ids = {id(c) for c in queue}
     skipped = [c for c in candidates if id(c) not in queued_ids]
+    for candidate in queue:
+        candidate.verification_queued = True
+    for candidate in skipped:
+        candidate.verification_exclusion_reason = (
+            f"outside verification budget (limit={limit})"
+        )
     if skipped:
         log.debug(
             "verification_queue: %d/%d candidates selected (budget=%d); "

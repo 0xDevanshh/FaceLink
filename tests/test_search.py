@@ -4,8 +4,12 @@ These are the pure functions between the browser and the verifier, so they are
 fully testable without touching the network.
 """
 
+import json
+from urllib.parse import parse_qs, urlparse
+
 import pytest
 
+from facechain.config import settings
 from facechain.search.base import (
     build_candidates,
     canonicalise_url,
@@ -15,6 +19,7 @@ from facechain.search.base import (
     normalise_domain,
     unwrap_redirect,
 )
+from facechain.search.serpapi import SerpApiAdapter
 
 
 @pytest.mark.parametrize(
@@ -150,3 +155,84 @@ def test_build_candidates_captures_thumbnail_and_title():
     c = build_candidates("yandex", rows)[0]
     assert c.title == "caption" and c.thumbnail == "https://cdn/x.jpg"
     assert c.platform == "Instagram"
+
+
+def test_serpapi_yandex_uses_public_url_and_documented_images_results(monkeypatch, tmp_path):
+    """Yandex reverse search is URL-only and returns images_results."""
+    image_path = tmp_path / "input.jpg"
+    image_path.write_bytes(b"image")
+    requested: dict[str, str] = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def read(self):
+            return json.dumps({
+                "images_results": [{
+                    "link": "https://linkedin.com/in/example",
+                    "title": "Example profile",
+                    "original": "https://media.licdn.com/original.jpg",
+                    "thumbnail": "https://avatars.mds.yandex.net/thumb.jpg",
+                }],
+            }).encode()
+
+    def fake_urlopen(request, timeout):
+        query = parse_qs(urlparse(request.full_url).query)
+        requested.update({key: values[0] for key, values in query.items()})
+        return FakeResponse()
+
+    monkeypatch.setattr(settings, "serpapi_key", "test-key")
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    result = SerpApiAdapter("yandex_images").search(
+        str(image_path), "https://public.example/input.jpg"
+    )
+
+    assert result.ok
+    assert requested["engine"] == "yandex_images"
+    assert requested["url"] == "https://public.example/input.jpg"
+    assert result.candidates[0].thumbnail == "https://media.licdn.com/original.jpg"
+
+
+def test_serpapi_yandex_reports_missing_public_url_without_request(monkeypatch, tmp_path):
+    image_path = tmp_path / "input.jpg"
+    image_path.write_bytes(b"image")
+    monkeypatch.setattr(settings, "serpapi_key", "test-key")
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("request made")),
+    )
+
+    result = SerpApiAdapter("yandex_images").search(str(image_path))
+
+    assert not result.ok
+    assert "public image URL" in result.error
+
+
+def test_serpapi_malformed_json_isolated_as_provider_failure(monkeypatch, tmp_path):
+    image_path = tmp_path / "input.jpg"
+    image_path.write_bytes(b"image")
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def read(self):
+            return b"[]"
+
+    monkeypatch.setattr(settings, "serpapi_key", "test-key")
+    monkeypatch.setattr("urllib.request.urlopen", lambda *args, **kwargs: FakeResponse())
+
+    result = SerpApiAdapter("yandex_images").search(
+        str(image_path), "https://public.example/input.jpg"
+    )
+
+    assert not result.ok
+    assert "malformed API response" in result.error

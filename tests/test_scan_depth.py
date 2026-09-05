@@ -57,6 +57,8 @@ class TestVerificationQueue:
         cands = self._many(20)
         queue = _verification_queue(cands, 5)
         assert len(queue) == 5
+        assert all(c.verification_queued for c in queue)
+        assert all(c.verification_exclusion_reason for c in cands[5:])
 
     def test_priority_platforms_come_first(self):
         wider = self._many(10, priority=OTHER_WEB_PRIORITY)
