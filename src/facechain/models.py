@@ -431,6 +431,9 @@ class ThresholdSnapshot(BaseModel):
     calibration_note: str = "thresholds are hand-set defaults, not calibrated on authorised pairs"
 
 
+from .enrichment.profile import ProfileGraph
+
+
 class Case(BaseModel):
     case_id: str
     pipeline_version: str = PIPELINE_VERSION
@@ -449,3 +452,5 @@ class Case(BaseModel):
     blockchain: Optional[ChainRecord] = None
     verdict: str = "INCOMPLETE"
     failure_reason: Optional[str] = None
+    # ---- enrichment (added after verification, optional) -----------------
+    profile_graph: Optional[ProfileGraph] = None

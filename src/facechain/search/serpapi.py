@@ -182,7 +182,15 @@ class SerpApiAdapter(SearchEngineAdapter):
                 rows.append({
                     "href": link,
                     "text": item.get("title") or item.get("source") or "",
-                    "thumb": item.get("thumbnail") or item.get("original") or "",
+                    # Prefer `original` (full-resolution source image, e.g.
+                    # media.licdn.com/dms/image/...) over `thumbnail` (Google's
+                    # compressed ~50 px cache copy, encrypted-tbn*.gstatic.com).
+                    # The old order (thumbnail or original) silently discarded the
+                    # full-res URL whenever a thumbnail was present — which is
+                    # always — causing ArcFace to compare against a 50 px cache
+                    # copy instead of the actual profile photo, producing
+                    # face_similarity ≈ 0.15–0.19 even for the correct person.
+                    "thumb": item.get("original") or item.get("thumbnail") or "",
                 })
 
         cands = build_candidates(self.name, rows)

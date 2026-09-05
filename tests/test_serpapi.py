@@ -167,3 +167,74 @@ def test_an_oversized_image_is_recompressed_under_the_upload_limit(tmp_path, mon
 
     assert seen_sizes, "upload should have been attempted"
     assert seen_sizes[0] < img.stat().st_size
+
+
+# ---- original-over-thumbnail priority (RCA fix) ---------------------------
+
+def test_original_image_url_takes_priority_over_thumbnail_in_result_rows(tmp_path, monkeypatch):
+    """Regression: serpapi.py used `thumbnail or original`, meaning the full-res
+    `original` field (media.licdn.com, pbs.twimg.com, etc.) was silently
+    discarded whenever a thumbnail was also present — which is always.
+
+    ArcFace comparing against a 50 px Google cache thumbnail of a LinkedIn
+    profile reliably scores ~0.15–0.19 even for the exact same person, which
+    is below the 0.38 verification threshold.  The fix reverses the priority
+    to `original or thumbnail` so the full-resolution source image is stored
+    in `candidate.thumbnail` and used for face comparison instead.
+    """
+    monkeypatch.setattr(settings, "serpapi_key", "test-key")
+    img = tmp_path / "face.jpg"
+    img.write_bytes(b"x" * 1000)
+
+    full_res_url = "https://media.licdn.com/dms/image/v2/profile.jpg"
+    compressed_thumb = "https://encrypted-tbn1.gstatic.com/images?q=tbn:abc"
+
+    def fake_urlopen(req, timeout=None):
+        if "serpapi.com/image" in req.full_url:
+            return _FakeResponse({"image_id": "id1"})
+        # Simulate a SerpAPI visual_matches item with BOTH fields present.
+        return _FakeResponse({
+            "visual_matches": [{
+                "link": "https://linkedin.com/in/someone",
+                "title": "Someone",
+                "original": full_res_url,      # full-res CDN image
+                "thumbnail": compressed_thumb,  # 50px Google cache — must NOT win
+            }]
+        })
+
+    monkeypatch.setattr("facechain.search.serpapi.urllib.request.urlopen", fake_urlopen)
+
+    result = SerpApiAdapter("google_lens").search(str(img))
+    assert result.candidates, "should have found a candidate"
+    cand = result.candidates[0]
+    assert cand.thumbnail == full_res_url, (
+        f"Expected full-res original URL in thumbnail, got: {cand.thumbnail}"
+    )
+    assert compressed_thumb not in cand.thumbnail
+
+
+def test_thumbnail_used_when_original_is_absent(tmp_path, monkeypatch):
+    """When `original` is absent the existing `thumbnail` must still be used."""
+    monkeypatch.setattr(settings, "serpapi_key", "test-key")
+    img = tmp_path / "face.jpg"
+    img.write_bytes(b"x" * 1000)
+
+    compressed_thumb = "https://encrypted-tbn1.gstatic.com/images?q=tbn:abc"
+
+    def fake_urlopen(req, timeout=None):
+        if "serpapi.com/image" in req.full_url:
+            return _FakeResponse({"image_id": "id1"})
+        return _FakeResponse({
+            "visual_matches": [{
+                "link": "https://linkedin.com/in/someone",
+                "title": "Someone",
+                "thumbnail": compressed_thumb,
+                # no "original" key
+            }]
+        })
+
+    monkeypatch.setattr("facechain.search.serpapi.urllib.request.urlopen", fake_urlopen)
+
+    result = SerpApiAdapter("google_lens").search(str(img))
+    assert result.candidates
+    assert result.candidates[0].thumbnail == compressed_thumb

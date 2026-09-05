@@ -35,6 +35,7 @@ from .verification.candidate import MediaCache, verify_candidate
 from .verification.evidence_graph import build_evidence_graph
 from .verification.image_similarity import perceptual_hashes
 from .verification.scorer import explain_failure, highest_stage_reached, rank, score_candidate
+from .enrichment.graph import enrich_case
 from .face.luxand import search_face as luxand_search_face
 
 log = logging.getLogger(__name__)
@@ -59,6 +60,8 @@ class RunOptions:
     # ---- scan depth -----------------------------------------------------
     # fast: small candidate set (10), standard: normal (12), deep: maximum (30+)
     scan_depth: str = "standard"  # fast | standard | deep
+    # ---- enrichment -----------------------------------------------------
+    enrich: bool = False  # Run cross-platform profile enrichment after verification
 
 
 class PipelineError(RuntimeError):
@@ -626,6 +629,21 @@ def run(opts: RunOptions, report: Reporter | None = None) -> Case:
         case.verdict = "VERIFIED_OFFCHAIN"
         case.failure_reason = f"blockchain stage failed: {str(exc)[:300]}"
         emit("chain", "fail", str(exc)[:300])
+
+    # ---- 8. optional profile enrichment ----------------------------------
+    # Runs only when requested (opts.enrich=True) and a verified candidate
+    # exists.  Entirely additive — never modifies the verdict or evidence hash.
+    if opts.enrich and case.verification:
+        try:
+            case.profile_graph = enrich_case(
+                case.verification,
+                embedding,
+                query_hashes,
+                emit=lambda stage, status, detail: emit(f"enrich:{stage}", status, detail),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("enrichment raised, skipping: %s", exc)
+            emit("enrich", "fail", f"skipped: {type(exc).__name__}")
 
     writer.write_bundle(case, path)
     return case
