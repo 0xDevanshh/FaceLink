@@ -442,6 +442,110 @@ class ThresholdSnapshot(BaseModel):
     calibration_note: str = "thresholds are hand-set defaults, not calibrated on authorised pairs"
 
 
+# ---------------------------------------------------------------------------
+# Known-person identity recognition (additive — see src/facechain/identity/).
+#
+# This never claims identity from face similarity alone: `IdentityResult.level`
+# is a composite of `supporting_evidence`, gated by a margin-over-second-best
+# check (see `identity/scorer.py`). `UNKNOWN` means "no reliable match", not
+# "confirmed not this person" — the system never asserts a negative either.
+# ---------------------------------------------------------------------------
+
+class IdentityLevel(str, Enum):
+    HIGH = "HIGH"
+    MEDIUM = "MEDIUM"
+    LOW = "LOW"
+    UNKNOWN = "UNKNOWN"
+
+
+class SocialAccountStatus(str, Enum):
+    """How confident we are this account genuinely belongs to the identified
+    person, as opposed to a fan page or impersonator. Never OFFICIAL merely
+    because a username matches the person's name — see `identity/social.py`.
+    """
+    OFFICIAL = "OFFICIAL"
+    LIKELY_OFFICIAL = "LIKELY_OFFICIAL"
+    UNVERIFIED = "UNVERIFIED"
+    REJECTED = "REJECTED"
+
+
+class SocialAccount(BaseModel):
+    """One public profile attributed to an identified known person."""
+
+    platform: str
+    username: str = ""
+    url: str
+    display_name: str = ""
+    profile_image: str = ""
+    status: SocialAccountStatus = SocialAccountStatus.UNVERIFIED
+    confidence: float = 0.0
+    source: str = ""  # "wikidata" | "this-scan-evidence" | "wikidata+this-scan-evidence"
+    evidence: list[str] = Field(default_factory=list)
+
+    def rounded(self) -> "SocialAccount":
+        s = self.model_copy()
+        s.confidence = q3(s.confidence)
+        return s
+
+
+class IdentityEvidence(BaseModel):
+    """One independent signal feeding an identity match — never opaque."""
+
+    kind: str  # "face_similarity" | "reference_consistency" | "reverse_image" | "web_profile" | "margin_check"
+    description: str
+    weight: float = 0.0
+    value: float = 0.0
+
+    def rounded(self) -> "IdentityEvidence":
+        e = self.model_copy()
+        e.weight = q3(e.weight)
+        e.value = q3(e.value)
+        return e
+
+
+class IdentityCandidate(BaseModel):
+    """One known person the query face was compared against — kept for
+    transparency even when a lower-ranked candidate does not win, so a
+    near-miss (see the mission's margin-check example) is auditable."""
+
+    person_id: str
+    name: str
+    face_similarity: float = 0.0
+    category: str = ""
+    occupation: str = ""
+
+    def rounded(self) -> "IdentityCandidate":
+        c = self.model_copy()
+        c.face_similarity = q3(c.face_similarity)
+        return c
+
+
+class IdentityResult(BaseModel):
+    """Known-person identity resolution for the scanned face."""
+
+    person_id: Optional[str] = None
+    name: Optional[str] = None
+    aliases: list[str] = Field(default_factory=list)
+    occupation: str = ""
+    category: str = ""
+    confidence: float = 0.0
+    level: IdentityLevel = IdentityLevel.UNKNOWN
+    face_similarity: float = 0.0
+    margin: float = 0.0  # top-vs-second-best-candidate gap
+    evidence_count: int = 0
+    supporting_evidence: list[IdentityEvidence] = Field(default_factory=list)
+    candidate_identities: list[IdentityCandidate] = Field(default_factory=list)
+
+    def rounded(self) -> "IdentityResult":
+        r = self.model_copy()
+        r.confidence = q3(r.confidence)
+        r.face_similarity = q3(r.face_similarity)
+        r.margin = q3(r.margin)
+        r.supporting_evidence = [e.rounded() for e in r.supporting_evidence]
+        r.candidate_identities = [c.rounded() for c in r.candidate_identities]
+        return r
+
+
 from .enrichment.profile import ProfileGraph
 
 
@@ -465,3 +569,9 @@ class Case(BaseModel):
     failure_reason: Optional[str] = None
     # ---- enrichment (added after verification, optional) -----------------
     profile_graph: Optional[ProfileGraph] = None
+    # ---- known-person identity recognition (additive, optional) ----------
+    # None/[] whenever identity resolution is disabled, the index artifact
+    # is absent, or no reliable match was found — every existing consumer of
+    # `Case` is unaffected either way.
+    identity: Optional[IdentityResult] = None
+    official_profiles: list[SocialAccount] = Field(default_factory=list)

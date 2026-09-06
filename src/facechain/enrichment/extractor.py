@@ -87,6 +87,15 @@ def _extract_username(url: str, platform: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
+def extract_username_from_url(url: str, platform: str) -> Optional[str]:
+    """Public wrapper: same per-platform username extraction as above.
+
+    Lets other modules (e.g. `identity/social.py`) reuse this single set of
+    patterns instead of keeping a second copy of them.
+    """
+    return _extract_username(url, platform)
+
+
 def _profile_id(platform: str, username: str) -> str:
     return f"{platform.lower().replace('/', '-').replace(' ', '-')}:{username.lower()}"
 

@@ -43,6 +43,7 @@ from .verification.scorer import (
 )
 from .enrichment.graph import enrich_case
 from .face.luxand import search_face as luxand_search_face
+from .identity import resolve as identity_resolve
 
 log = logging.getLogger(__name__)
 
@@ -387,6 +388,18 @@ def run(opts: RunOptions, report: Reporter | None = None) -> Case:
         f"det {face_record.det_score:.3f}",
     )
 
+    # ---- 2b. known-person identity recognition (additive, optional) -----
+    # Face-embedding-only pass — before search, so a photo of a known person
+    # still gets an identity even if reverse-image search later finds
+    # nothing at all. Never raises; case.identity stays None on any failure.
+    case.identity = identity_resolve.resolve_preliminary(embedding)
+    if case.identity is not None:
+        emit(
+            "identity", "info",
+            f"preliminary: {case.identity.name or 'no confident match'} "
+            f"({case.identity.level.value}, face {case.identity.face_similarity:.3f})",
+        )
+
     # ---- 3. reverse image search ----------------------------------------
     #
     # The *query* is the region the operator selected, not always the whole
@@ -549,6 +562,19 @@ def run(opts: RunOptions, report: Reporter | None = None) -> Case:
     case.verification = ranked
     case.stages_passed = highest_stage_reached(ranked)
     case.best_match = ranked[0] if ranked else None
+
+    # Enrich the preliminary identity match (if any) with this scan's own
+    # reverse-image/verification evidence — runs on every path, including the
+    # UNVERIFIED early-return just below, so identity is available even when
+    # no reverse-image candidate itself verifies. Never raises.
+    case.identity = identity_resolve.enrich_with_evidence(case.identity, embedding, case)
+    if case.identity is not None:
+        emit(
+            "identity", "ok" if case.identity.name else "info",
+            f"{case.identity.name or 'no confident match'} "
+            f"({case.identity.level.value}, confidence {case.identity.confidence:.3f}, "
+            f"{case.identity.evidence_count} independent signal(s))",
+        )
 
     confirmed = next((c for c in ranked if c.verified), None)
     if confirmed is None:

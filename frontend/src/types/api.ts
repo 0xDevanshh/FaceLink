@@ -245,6 +245,55 @@ export interface ChainRecord {
   note: string
 }
 
+/** Known-person identity recognition — additive, always optional. Absent or
+ * `null` on any case that predates this feature or found no reliable match;
+ * every existing `CaseResult` consumer is unaffected either way. */
+export type IdentityLevel = 'HIGH' | 'MEDIUM' | 'LOW' | 'UNKNOWN'
+
+export type SocialAccountStatus = 'OFFICIAL' | 'LIKELY_OFFICIAL' | 'UNVERIFIED' | 'REJECTED'
+
+export interface SocialAccount {
+  platform: string
+  username: string
+  url: string
+  display_name: string
+  profile_image: string
+  status: SocialAccountStatus
+  confidence: number
+  source: string
+  evidence: string[]
+}
+
+export interface IdentityEvidence {
+  kind: string
+  description: string
+  weight: number
+  value: number
+}
+
+export interface IdentityCandidate {
+  person_id: string
+  name: string
+  face_similarity: number
+  category: string
+  occupation: string
+}
+
+export interface IdentityResult {
+  person_id: string | null
+  name: string | null
+  aliases: string[]
+  occupation: string
+  category: string
+  confidence: number
+  level: IdentityLevel
+  face_similarity: number
+  margin: number
+  evidence_count: number
+  supporting_evidence: IdentityEvidence[]
+  candidate_identities: IdentityCandidate[]
+}
+
 export interface CaseResult {
   case_id: string
   pipeline_version: string
@@ -261,6 +310,8 @@ export interface CaseResult {
   threshold_snapshot: ThresholdSnapshot | null
   stages_passed: string[]
   blockchain: ChainRecord | null
+  identity?: IdentityResult | null
+  official_profiles?: SocialAccount[]
 }
 
 export interface HealthResponse {

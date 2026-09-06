@@ -1,5 +1,6 @@
 import React, { useState } from 'react'
 import CandidateCard from './CandidateCard'
+import IdentitySection from './IdentitySection'
 import type { ScanState } from '../App'
 import type { VerifiedCandidate } from '../types/api'
 import { api } from '../api/client'
@@ -362,6 +363,10 @@ export default function ResultView({ scan, onViewEvidence, onNewScan }: Props) {
           </div>
         </section>
       )}
+
+      {/* Known-person identity recognition — additive, renders nothing when
+          no reliable match exists (see IdentitySection's own guard). */}
+      <IdentitySection result={result} />
 
       {/* Best match, called out explicitly. Chosen by evidential strength, so
           a strong match on the wider web outranks a weaker one on a priority

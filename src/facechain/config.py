@@ -359,6 +359,35 @@ class Settings(BaseSettings):
     # ---- output ----------------------------------------------------------
     evidence_dir: Path = Field(default=REPO_ROOT / "evidence")
 
+    # ---- known-person identity recognition (additive, optional) ---------
+    # Off has no effect on anything else: the existing reverse-image-search
+    # pipeline is unaware this setting exists. On with no built index present
+    # is also a safe no-op (`identity/index.py` returns an empty index rather
+    # than raising) — a checkout without `identity_index/` behaves exactly as
+    # it does today.
+    identity_enabled: bool = True
+    identity_index_dir: Path = Field(default=REPO_ROOT / "identity_index")
+    # Composite score weights (mission section 5) — must sum to 1.0, checked
+    # in identity/scorer.py rather than assumed.
+    identity_weight_face: float = 0.60
+    identity_weight_reference_consistency: float = 0.15
+    identity_weight_reverse_image: float = 0.15
+    identity_weight_web_profile: float = 0.10
+    # How many of the index's own reference embeddings for a person are
+    # averaged into "reference consistency" (mission section 3: compare
+    # against multiple embeddings, not one).
+    identity_top_k: int = 5
+    # The non-negotiable false-positive guard (mission section 6): the top
+    # candidate's face similarity must exceed this AND beat the second-best
+    # candidate by at least `identity_margin_min`, or the result is capped at
+    # LOW/UNKNOWN regardless of the raw similarity number.
+    identity_face_threshold_high: float = 0.65
+    identity_face_threshold_medium: float = 0.50
+    identity_margin_min: float = 0.08
+    # Confidence bands on the final composite score (0..1) -> IdentityLevel.
+    identity_confidence_high: float = 0.85
+    identity_confidence_medium: float = 0.60
+
     @property
     def engine_list(self) -> list[str]:
         return [e.strip() for e in self.engines.split(",") if e.strip()]
