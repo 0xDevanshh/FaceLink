@@ -122,6 +122,9 @@ SEED_PEOPLE: list[dict] = [
     {"name": "J.K. Rowling", "category": "authors", "occupation": "Author"},
     {"name": "Malala Yousafzai", "category": "public_figures", "occupation": "Education activist"},
     {"name": "Oprah Winfrey", "category": "entertainment", "occupation": "Media executive and host"},
+    {"name": "Chris Evans", "category": "actors", "occupation": "Actor"},
+    {"name": "Zendaya", "category": "actors", "occupation": "Actor"},
+    {"name": "Elon Musk", "category": "technology", "occupation": "CEO, Tesla and SpaceX"},
 ]
 
 
@@ -150,10 +153,42 @@ def _get_with_retries(url: str, params: Optional[dict] = None) -> Optional[bytes
     return None
 
 
-def search_wikidata_qid(name: str) -> Optional[str]:
-    """Resolve a person's name to a Wikidata QID via the public search API."""
+# Category -> plausible words in a Wikidata search result's own `description`
+# field, used only to disambiguate WHICH same-named entity is meant (e.g.
+# "Chris Evans" matches an author, a British politician, AND the American
+# actor — Wikidata's default relevance ranking is not fame-aware). This maps
+# generic categories to generic keywords; it names no specific person and
+# applies identically regardless of which name is being resolved.
+_CATEGORY_HINTS: dict[str, tuple[str, ...]] = {
+    "actors": ("actor", "actress"),
+    "musicians": ("singer", "musician", "rapper", "songwriter"),
+    "technology": ("ceo", "businessperson", "entrepreneur", "engineer", "computer scientist", "executive"),
+    "business": ("businessman", "businesswoman", "businessperson", "investor", "entrepreneur", "executive"),
+    "politics": ("politician", "president", "prime minister", "senator"),
+    "science": ("physicist", "scientist", "chemist", "astrophysicist", "mathematician"),
+    "sports": ("tennis", "footballer", "athlete", "player", "basketball"),
+    "founders": ("engineer", "computer scientist", "entrepreneur", "programmer", "founder"),
+    "authors": ("author", "writer", "novelist"),
+    "creators": ("youtuber", "content creator", "influencer"),
+    "influencers": ("influencer", "content creator", "personality"),
+    "academics": ("professor", "academic", "researcher"),
+    "public_figures": ("activist", "public figure"),
+    "entertainment": ("host", "media", "actress", "actor", "presenter"),
+}
+
+
+def search_wikidata_qid(name: str, category: str = "") -> Optional[str]:
+    """Resolve a person's name to a Wikidata QID via the public search API.
+
+    Common names are genuinely ambiguous — Wikidata's own relevance ranking
+    is not fame-aware, so the top result for "Chris Evans" is an author, not
+    the actor. When `category` is given, the first candidate whose own
+    Wikidata `description` contains one of that category's hint words (see
+    `_CATEGORY_HINTS` — generic, never person-specific) wins; otherwise this
+    falls back to the plain top result, unchanged from before.
+    """
     body = _get_with_retries(WIKIDATA_API, params={
-        "action": "wbsearchentities", "search": name, "language": "en", "format": "json", "limit": 1,
+        "action": "wbsearchentities", "search": name, "language": "en", "format": "json", "limit": 5,
     })
     if body is None:
         return None
@@ -161,6 +196,17 @@ def search_wikidata_qid(name: str) -> Optional[str]:
     if not results:
         log.warning("no Wikidata entity found for %r", name)
         return None
+
+    hints = _CATEGORY_HINTS.get(category, ())
+    if hints:
+        for hit in results:
+            description = (hit.get("description") or "").lower()
+            if any(h in description for h in hints):
+                if hit is not results[0]:
+                    log.info("disambiguated %r to %s (%r) over the plain top search result",
+                            name, hit["id"], hit.get("description"))
+                return hit["id"]
+
     hit = results[0]
     if hit.get("label", "").lower() != name.lower():
         log.warning("Wikidata's best match for %r is labelled %r (%s) — using it, but verify",
@@ -212,7 +258,7 @@ def fetch_commons_category_files(category: str, limit: int) -> list[str]:
 def build_person_record(seed: dict) -> Optional[dict]:
     """Resolve one seed entry to raw fields ready for embedding. Returns
     `None` (logs why) rather than raising if the person can't be resolved."""
-    qid = search_wikidata_qid(seed["name"])
+    qid = search_wikidata_qid(seed["name"], seed.get("category", ""))
     if qid is None:
         return None
     time.sleep(REQUEST_DELAY_S)

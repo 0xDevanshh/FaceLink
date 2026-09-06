@@ -76,8 +76,26 @@ def enrich_with_evidence(
         result = _enrich_score(matches, reverse_image_score, web_profile_score, extra)
 
         if result is not None and result.name:
-            from .social import build_official_profiles
-            case.official_profiles = build_official_profiles(top_person, case)
+            from .social import build_official_profiles, discover_from_evidence, merge_profiles
+            # Two independent sources, merged: the matched person's
+            # pre-vetted (Wikidata) accounts, and profiles discovered
+            # directly from this scan's own reverse-image evidence — the
+            # second never depends on the index having anything for a given
+            # platform, and is what lets a person whose Wikidata coverage is
+            # sparse (or who isn't extensively catalogued at all) still get
+            # real, evidence-backed profiles rather than none.
+            index_profiles = build_official_profiles(top_person, case)
+            evidence_profiles = discover_from_evidence(result.name, result.aliases, case)
+            case.official_profiles = merge_profiles(index_profiles, evidence_profiles)
+
+            from . import api_ninjas
+            # Metadata enrichment for the name ALREADY resolved above — never
+            # able to change `result` itself. `fetch_celebrity_info` never
+            # raises (a missing key, network error, timeout, rate limit, or
+            # no plausible match all just mean unavailable), so celebrity
+            # enrichment failing can never affect identity/social-profile
+            # results already computed in this same call.
+            case.celebrity = api_ninjas.fetch_celebrity_info(result.name)
 
         return result
     except Exception as exc:  # noqa: BLE001

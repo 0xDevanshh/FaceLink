@@ -388,6 +388,20 @@ class Settings(BaseSettings):
     identity_confidence_high: float = 0.85
     identity_confidence_medium: float = 0.60
 
+    # ---- API Ninjas celebrity enrichment (additive, optional) ------------
+    # Purely metadata enrichment for an identity ALREADY resolved by face
+    # evidence — never used for face recognition, never able to change who
+    # was identified or with what confidence. Missing key is a safe no-op,
+    # same guarantee as every other optional third-party key in this file.
+    api_ninjas_api_key: str = ""
+    api_ninjas_base_url: str = "https://api.api-ninjas.com/v1/celebrity"
+    api_ninjas_connect_timeout_s: float = 3.0
+    api_ninjas_read_timeout_s: float = 5.0
+    # Celebrity metadata (nationality/occupation/birthday/...) changes rarely
+    # — a day-long cache avoids re-querying the same person on every repeat
+    # scan without risking long-stale data.
+    api_ninjas_cache_ttl_s: float = 86400.0
+
     @property
     def engine_list(self) -> list[str]:
         return [e.strip() for e in self.engines.split(",") if e.strip()]

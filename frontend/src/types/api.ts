@@ -294,6 +294,24 @@ export interface IdentityResult {
   candidate_identities: IdentityCandidate[]
 }
 
+/** Optional celebrity metadata enrichment (API Ninjas), additive to an
+ * identity already resolved by face evidence. `available: false` covers
+ * every reason it might be missing — no key configured, network error,
+ * timeout, rate limit, or no plausible name match. */
+export interface CelebrityInfo {
+  available: boolean
+  name: string | null
+  nationality: string | null
+  occupations: string[]
+  birthday: string | null
+  age: number | null
+  gender: string | null
+  height: number | null
+  net_worth: number | null
+  is_alive: boolean | null
+  source: string
+}
+
 export interface CaseResult {
   case_id: string
   pipeline_version: string
@@ -312,6 +330,7 @@ export interface CaseResult {
   blockchain: ChainRecord | null
   identity?: IdentityResult | null
   official_profiles?: SocialAccount[]
+  celebrity?: CelebrityInfo | null
 }
 
 export interface HealthResponse {

@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { render, screen, fireEvent } from '@testing-library/react'
 import IdentitySection from '../components/IdentitySection'
-import type { CaseResult, IdentityResult, SocialAccount } from '../types/api'
+import type { CaseResult, CelebrityInfo, IdentityResult, SocialAccount } from '../types/api'
 
 function makeIdentity(overrides: Partial<IdentityResult> = {}): IdentityResult {
   return {
@@ -32,13 +32,27 @@ function makeAccount(overrides: Partial<SocialAccount> = {}): SocialAccount {
   }
 }
 
-function makeResult(identity: IdentityResult | null, profiles: SocialAccount[] = []): CaseResult {
+function makeCelebrity(overrides: Partial<CelebrityInfo> = {}): CelebrityInfo {
+  return {
+    available: true, name: 'Sundar Pichai', nationality: 'in',
+    occupations: ['businessperson', 'executive'], birthday: '1972-07-12',
+    age: 54, gender: 'male', height: 1.73, net_worth: 1500000000, is_alive: true,
+    source: 'api_ninjas',
+    ...overrides,
+  }
+}
+
+function makeResult(
+  identity: IdentityResult | null,
+  profiles: SocialAccount[] = [],
+  celebrity: CelebrityInfo | null = null,
+): CaseResult {
   return {
     case_id: 'case_test', pipeline_version: '1.0.0', created_at: 'now',
     verdict: 'VERIFIED_OFFCHAIN', failure_reason: null, evidence_sha256: null,
     face: null, face_selection: null, reverse_search: null, verification: [],
     best_match: null, evidence_graph: null, threshold_snapshot: null, stages_passed: [],
-    blockchain: null, identity, official_profiles: profiles,
+    blockchain: null, identity, official_profiles: profiles, celebrity,
   }
 }
 
@@ -89,5 +103,40 @@ describe('IdentitySection', () => {
   it('never presents the identity as a definitive claim', () => {
     render(<IdentitySection result={makeResult(makeIdentity())} />)
     expect(screen.getByText(/not a definitive claim of identity/i)).toBeInTheDocument()
+  })
+
+  // ---- API Ninjas celebrity metadata enrichment (additive) --------------
+
+  it('renders celebrity occupation, nationality, birthday, and age when available', () => {
+    render(<IdentitySection result={makeResult(makeIdentity(), [], makeCelebrity())} />)
+    expect(screen.getByText('businessperson / executive')).toBeInTheDocument()
+    expect(screen.getByText(/India/)).toBeInTheDocument()
+    expect(screen.getByText('July 12, 1972')).toBeInTheDocument()
+    expect(screen.getByText('54')).toBeInTheDocument()
+  })
+
+  it('does not render a celebrity block when unavailable', () => {
+    const unavailable = makeCelebrity({ available: false, name: null, occupations: [] })
+    render(<IdentitySection result={makeResult(makeIdentity(), [], unavailable)} />)
+    expect(screen.queryByLabelText('Celebrity information')).not.toBeInTheDocument()
+  })
+
+  it('does not render a celebrity block when celebrity data is absent entirely', () => {
+    render(<IdentitySection result={makeResult(makeIdentity())} />)
+    expect(screen.queryByLabelText('Celebrity information')).not.toBeInTheDocument()
+  })
+
+  it('falls back to the identity occupation when celebrity has none', () => {
+    const celebrity = makeCelebrity({ occupations: [], birthday: null, age: null })
+    render(<IdentitySection result={makeResult(makeIdentity(), [], celebrity)} />)
+    expect(screen.getByText('CEO, Google and Alphabet')).toBeInTheDocument()
+  })
+
+  it('official profiles still come from the existing social-discovery system, not from celebrity data', () => {
+    const account = makeAccount()
+    render(<IdentitySection result={makeResult(makeIdentity(), [account], makeCelebrity())} />)
+    // Only the one profile explicitly passed via official_profiles renders —
+    // celebrity metadata contributes no profile links of its own.
+    expect(screen.getAllByRole('link')).toHaveLength(1)
   })
 })

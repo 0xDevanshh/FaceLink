@@ -7,20 +7,23 @@ from __future__ import annotations
 import hashlib
 import json
 
+import httpx
 import numpy as np
 import pytest
 
 from facechain.config import settings
-from facechain.identity import resolve
+from facechain.identity import api_ninjas, resolve
 from facechain.identity.index import reset_cache
 from facechain.models import Case, IdentityLevel, SearchCandidate, SearchReport
 
 
 @pytest.fixture(autouse=True)
 def _reset():
+    api_ninjas.reset_cache()
     reset_cache()
     yield
     reset_cache()
+    api_ninjas.reset_cache()
 
 
 def _write_index(tmp_path, people: list[dict], embeddings: np.ndarray):
@@ -127,3 +130,84 @@ def test_a_broken_index_never_raises_out_of_enrich_and_returns_preliminary(monke
     preliminary = IdentityResult(name="Whatever", level=IdentityLevel.MEDIUM)
     result = resolve.enrich_with_evidence(preliminary, np.array([1.0, 0.0, 0.0]), case)
     assert result is preliminary
+
+
+# ---- API Ninjas celebrity enrichment wired into resolve_with_evidence -----
+
+def test_celebrity_metadata_is_populated_when_a_name_is_resolved(tmp_path, monkeypatch):
+    _setup_index(tmp_path, monkeypatch)
+    monkeypatch.setattr(settings, "api_ninjas_api_key", "test-key")
+
+    def _get(url, params=None, headers=None, timeout=None):
+        return httpx.Response(200, json=[{"name": "jane doe", "age": 40, "nationality": "us"}],
+                              request=httpx.Request("GET", url))
+    monkeypatch.setattr(httpx, "get", _get)
+
+    embedding = np.array([1.0, 0.0, 0.0])
+    preliminary = resolve.resolve_preliminary(embedding)
+    case = Case(case_id="case_test", created_at="now", observed_at=0)
+    resolve.enrich_with_evidence(preliminary, embedding, case)
+
+    assert case.celebrity is not None
+    assert case.celebrity.available is True
+    assert case.celebrity.name == "Jane Doe"  # the resolved identity name, not API Ninjas' casing
+    assert case.celebrity.age == 40
+
+
+def test_no_api_ninjas_key_leaves_celebrity_unavailable_but_identity_intact(tmp_path, monkeypatch):
+    _setup_index(tmp_path, monkeypatch)
+    monkeypatch.setattr(settings, "api_ninjas_api_key", "")
+
+    embedding = np.array([1.0, 0.0, 0.0])
+    preliminary = resolve.resolve_preliminary(embedding)
+    case = Case(case_id="case_test", created_at="now", observed_at=0)
+    final = resolve.enrich_with_evidence(preliminary, embedding, case)
+
+    assert final.name == "Jane Doe"  # identity resolution is completely unaffected
+    assert case.celebrity is not None
+    assert case.celebrity.available is False
+
+
+def test_api_ninjas_network_failure_does_not_affect_identity_or_profiles(tmp_path, monkeypatch):
+    _setup_index(tmp_path, monkeypatch)
+    monkeypatch.setattr(settings, "api_ninjas_api_key", "test-key")
+    monkeypatch.setattr(httpx, "get", lambda *a, **kw: (_ for _ in ()).throw(httpx.ConnectError("boom")))
+
+    embedding = np.array([1.0, 0.0, 0.0])
+    preliminary = resolve.resolve_preliminary(embedding)
+    case = Case(
+        case_id="case_test", created_at="now", observed_at=0,
+        reverse_search=SearchReport(candidates=[
+            SearchCandidate(engine="yandex", url="https://github.com/janedoe",
+                            domain="github.com", title="Jane Doe on GitHub"),
+        ]),
+    )
+    final = resolve.enrich_with_evidence(preliminary, embedding, case)
+
+    # Identity + official-profile resolution (computed before the celebrity
+    # call) are completely unaffected by API Ninjas failing.
+    assert final.level == IdentityLevel.HIGH
+    assert case.official_profiles
+    assert case.celebrity.available is False
+
+
+def test_celebrity_metadata_can_never_override_the_resolved_identity_name(tmp_path, monkeypatch):
+    """Even if API Ninjas returned a different-looking name, the identity
+    the face-evidence layer resolved must be what the caller already has —
+    celebrity enrichment never writes back into `IdentityResult`."""
+    _setup_index(tmp_path, monkeypatch)
+    monkeypatch.setattr(settings, "api_ninjas_api_key", "test-key")
+
+    def _get(url, params=None, headers=None, timeout=None):
+        return httpx.Response(200, json=[{"name": "Someone Completely Different"}],
+                              request=httpx.Request("GET", url))
+    monkeypatch.setattr(httpx, "get", _get)
+
+    embedding = np.array([1.0, 0.0, 0.0])
+    preliminary = resolve.resolve_preliminary(embedding)
+    case = Case(case_id="case_test", created_at="now", observed_at=0)
+    final = resolve.enrich_with_evidence(preliminary, embedding, case)
+
+    assert final.name == "Jane Doe"  # IdentityResult itself: completely untouched
+    # API Ninjas' name didn't even plausibly match -> no celebrity data attached.
+    assert case.celebrity.available is False

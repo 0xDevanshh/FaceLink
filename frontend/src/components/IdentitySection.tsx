@@ -8,6 +8,46 @@ const LEVEL_STYLE: Record<string, string> = {
   UNKNOWN: 'text-muted border-border',
 }
 
+/** ISO 3166-1 alpha-2 code -> flag emoji (regional indicator symbols).
+ * Returns "" for anything that isn't exactly two letters, rather than
+ * rendering a broken glyph. */
+function countryFlagEmoji(code: string | null | undefined): string {
+  if (!code || code.length !== 2) return ''
+  const upper = code.toUpperCase()
+  if (!/^[A-Z]{2}$/.test(upper)) return ''
+  const base = 0x1f1e6 // regional indicator symbol letter A
+  const chars = [...upper].map((c) => base + (c.charCodeAt(0) - 65))
+  return String.fromCodePoint(...chars)
+}
+
+function formatBirthday(iso: string | null | undefined): string {
+  if (!iso) return ''
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return iso
+  return d.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric', timeZone: 'UTC' })
+}
+
+// Common ISO 3166-1 alpha-2 codes -> English name, best-effort display only.
+// Falls back to the raw uppercased code for anything not listed here — never
+// blocks rendering on an incomplete map.
+const COUNTRY_NAMES: Record<string, string> = {
+  us: 'United States', in: 'India', gb: 'United Kingdom', ca: 'Canada', au: 'Australia',
+  de: 'Germany', fr: 'France', it: 'Italy', es: 'Spain', pt: 'Portugal', nl: 'Netherlands',
+  se: 'Sweden', no: 'Norway', dk: 'Denmark', fi: 'Finland', ie: 'Ireland', ch: 'Switzerland',
+  at: 'Austria', be: 'Belgium', pl: 'Poland', ru: 'Russia', ua: 'Ukraine', cn: 'China',
+  jp: 'Japan', kr: 'South Korea', tw: 'Taiwan', hk: 'Hong Kong', sg: 'Singapore',
+  my: 'Malaysia', th: 'Thailand', vn: 'Vietnam', ph: 'Philippines', id: 'Indonesia',
+  pk: 'Pakistan', bd: 'Bangladesh', lk: 'Sri Lanka', np: 'Nepal', ae: 'United Arab Emirates',
+  sa: 'Saudi Arabia', il: 'Israel', tr: 'Turkey', eg: 'Egypt', za: 'South Africa',
+  ng: 'Nigeria', ke: 'Kenya', br: 'Brazil', mx: 'Mexico', ar: 'Argentina', cl: 'Chile',
+  co: 'Colombia', pe: 'Peru', nz: 'New Zealand',
+}
+
+function countryName(code: string | null | undefined): string {
+  if (!code) return ''
+  return COUNTRY_NAMES[code.toLowerCase()] ?? code.toUpperCase()
+}
+
 const STATUS_ICON: Record<SocialAccountStatus, string> = {
   OFFICIAL: '✓',
   LIKELY_OFFICIAL: '?',
@@ -46,6 +86,7 @@ export default function IdentitySection({ result }: Props) {
 
   const levelStyle = LEVEL_STYLE[identity.level] ?? LEVEL_STYLE.UNKNOWN
   const profiles = result.official_profiles ?? []
+  const celebrity = result.celebrity?.available ? result.celebrity : null
 
   return (
     <section className="mb-6 rounded-lg border border-border bg-surface-1 p-5" aria-labelledby="identity-heading">
@@ -56,14 +97,39 @@ export default function IdentitySection({ result }: Props) {
       <div className="flex items-start justify-between gap-4 flex-wrap">
         <div>
           <div className="text-xl font-bold text-gray-100">{identity.name}</div>
-          {identity.occupation && (
-            <p className="text-sm text-muted mt-0.5">{identity.occupation}</p>
-          )}
+          <p className="text-sm text-muted mt-0.5">
+            {(celebrity?.occupations.length ? celebrity.occupations.join(' / ') : identity.occupation) || null}
+            {celebrity?.nationality && (
+              <span className="ml-2">
+                {countryFlagEmoji(celebrity.nationality)} {countryName(celebrity.nationality)}
+              </span>
+            )}
+          </p>
         </div>
         <div className={`px-3 py-1 rounded border text-sm font-mono ${levelStyle}`}>
           {identity.level} CONFIDENCE · {Math.round(identity.confidence * 100)}%
         </div>
       </div>
+
+      {/* Celebrity metadata (API Ninjas) — additive enrichment of the
+          identity already resolved above; never a source of identity or
+          social-account verification itself. */}
+      {celebrity && (celebrity.birthday || celebrity.age != null) && (
+        <div className="mt-3 grid grid-cols-2 gap-3 text-xs" aria-label="Celebrity information">
+          {celebrity.birthday && (
+            <div>
+              <span className="text-muted">Born</span>
+              <div className="font-mono text-gray-300">{formatBirthday(celebrity.birthday)}</div>
+            </div>
+          )}
+          {celebrity.age != null && (
+            <div>
+              <span className="text-muted">Age</span>
+              <div className="font-mono text-gray-300">{celebrity.age}</div>
+            </div>
+          )}
+        </div>
+      )}
 
       <div className="mt-3 grid grid-cols-3 gap-3 text-xs">
         <div>

@@ -546,6 +546,28 @@ class IdentityResult(BaseModel):
         return r
 
 
+class CelebrityInfo(BaseModel):
+    """Optional celebrity metadata enrichment (API Ninjas), additive to an
+    identity ALREADY resolved by face evidence — see `identity/api_ninjas.py`.
+    Never influences `IdentityResult`; `available=False` covers every
+    failure mode (no key configured, network error, timeout, rate limit,
+    auth error, malformed response, no plausible name match) uniformly, so a
+    caller never has to distinguish "why" — only whether to render this.
+    """
+
+    available: bool = False
+    name: Optional[str] = None
+    nationality: Optional[str] = None
+    occupations: list[str] = Field(default_factory=list)
+    birthday: Optional[str] = None
+    age: Optional[int] = None
+    gender: Optional[str] = None
+    height: Optional[float] = None
+    net_worth: Optional[int] = None
+    is_alive: Optional[bool] = None
+    source: str = "api_ninjas"
+
+
 from .enrichment.profile import ProfileGraph
 
 
@@ -575,3 +597,8 @@ class Case(BaseModel):
     # `Case` is unaffected either way.
     identity: Optional[IdentityResult] = None
     official_profiles: list[SocialAccount] = Field(default_factory=list)
+    # Set only once identity resolution has produced a name (HIGH/MEDIUM) —
+    # None when there was no name to enrich in the first place, distinct from
+    # `CelebrityInfo(available=False)` (a name existed but enrichment failed
+    # or found nothing).
+    celebrity: Optional[CelebrityInfo] = None
